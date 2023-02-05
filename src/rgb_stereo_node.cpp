@@ -295,7 +295,7 @@ int main(int argc, char ** argv)
                                         // and image type is also same we can reuse it
         std::placeholders::_1,
         std::placeholders::_2),
-      30,
+      monoFramerate,
       stereoCameraInfo,
       "stereo");
   }
@@ -312,7 +312,7 @@ int main(int argc, char ** argv)
                                       // and image type is also same we can reuse it
         std::placeholders::_1,
         std::placeholders::_2),
-      30,
+      colorFramerate,
       previewCameraInfo,
       "color/preview");
   }
@@ -329,7 +329,7 @@ int main(int argc, char ** argv)
                                       // and image type is also same we can reuse it
         std::placeholders::_1,
         std::placeholders::_2),
-      30,
+      colorFramerate,
       videoCameraInfo,
       "color/video");
   }
