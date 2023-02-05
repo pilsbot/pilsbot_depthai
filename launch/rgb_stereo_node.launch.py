@@ -204,7 +204,7 @@ def generate_launch_description():
                             condition=IfCondition(publish_urdf))
 
     rgb_stereo_node = launch_ros.actions.Node(
-            package='pilsbot_oak_d', executable='rgb_stereo_node',
+            package='pilsbot_depthai', executable='rgb_stereo_node',
             output='screen',
             parameters=[{'tf_prefix': tf_prefix},
                         {'lrcheck': lrcheck},
