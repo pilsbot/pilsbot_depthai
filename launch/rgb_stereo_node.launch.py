@@ -11,9 +11,9 @@ import launch_ros.descriptions
 
 
 def generate_launch_description():
-    default_rviz = os.path.join(get_package_share_directory('depthai_examples'),
-                                'rviz', 'pointCloud.rviz')
-    urdf_launch_dir = os.path.join(get_package_share_directory('depthai_bridge'), 'launch')
+    # default_rviz = os.path.join(get_package_share_directory('depthai_examples'),
+    #                             'rviz', 'pointCloud.rviz')
+    urdf_launch_dir = os.path.join(get_package_share_directory('depthai_descriptions'), 'launch')
 
     tf_prefix    = LaunchConfiguration('tf_prefix',    default = 'oak')
     camera_model = LaunchConfiguration('camera_model', default = 'OAK-D')
@@ -262,9 +262,9 @@ def generate_launch_description():
             ],
             output='screen',)
 
-    rviz_node = launch_ros.actions.Node(
-            package='rviz2', executable='rviz2', output='screen',
-            arguments=['--display-config', default_rviz])
+    # rviz_node = launch_ros.actions.Node(
+    #         package='rviz2', executable='rviz2', output='screen',
+    #         arguments=['--display-config', default_rviz])
 
     ld = LaunchDescription()
     ld.add_action(declare_tf_prefix_cmd)
