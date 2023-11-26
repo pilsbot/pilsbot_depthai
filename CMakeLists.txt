@@ -60,6 +60,7 @@ macro(dai_add_node_ros2 node_name node_src)
 endmacro()
 
 dai_add_node_ros2(rgb_stereo_node src/rgb_stereo_node.cpp)
+dai_add_node_ros2(h265_node src/h265_node.cpp)
 
 
 if(BUILD_TESTING)
@@ -75,6 +76,7 @@ endif()
 
 install(TARGETS
         rgb_stereo_node
+        h265_node
         DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY launch/ DESTINATION share/${PROJECT_NAME}/launch
