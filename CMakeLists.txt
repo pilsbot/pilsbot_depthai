@@ -52,7 +52,13 @@ macro(dai_add_node_ros2 node_name node_src)
   target_link_libraries("${node_name}"
                         depthai::core
                         opencv_imgproc
-                        opencv_highgui)
+                        opencv_highgui
+                        avcodec 
+                        avformat 
+                        avutil 
+                        avdevice 
+                        avfilter 
+                        swscale)
 
   ament_target_dependencies("${node_name}"
                             ${dependencies})

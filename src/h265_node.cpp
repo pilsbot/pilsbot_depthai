@@ -1,190 +1,144 @@
-#include <chrono>
-#include <cstdio>
-#include <functional>
-#include <iostream>
-#include <tuple>
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/imgutils.h>
+}
 
-#include "rclcpp/rclcpp.hpp"
-
-#include <camera_info_manager/camera_info_manager.hpp>
+#include <opencv2/opencv.hpp>
+#include <rclcpp/rclcpp.hpp>
+#include <cv_bridge/cv_bridge.h>
 #include <sensor_msgs/msg/image.hpp>
-
-#include <depthai_bridge/BridgePublisher.hpp>
-#include <depthai_bridge/ImageConverter.hpp>
 
 #include <depthai/depthai.hpp>
 
-std::tuple<dai::Pipeline, int, int> createPipeline(
-  bool lrcheck,
-  bool extended,
-  bool subpixel,
-  int confidence,
-  int LRchecktresh,
-  bool useVideo,
-  bool usePreview,
-  int previewWidth,
-  int previewHeight,
-  std::string mResolution,
-  std::string cResolution,
-  int mFramerate,
-  int cFramerate)
-{
-  dai::Pipeline pipeline;
+std::tuple<dai::Pipeline, int, int> createPipeline(int previewWidth, int previewHeight, int colorFramerate) {
+    dai::Pipeline pipeline;
 
-  auto colorCam = pipeline.create<dai::node::ColorCamera>();
-  // auto monoLeft = pipeline.create<dai::node::MonoCamera>();
-  // auto monoRight = pipeline.create<dai::node::MonoCamera>();
-  dai::ColorCameraProperties::SensorResolution colorResolution;
-  if (cResolution == "480p" || cResolution == "720p" || cResolution == "1080p") {
-    colorResolution = dai::ColorCameraProperties::SensorResolution::THE_1080_P;
-  } else if (cResolution == "4K") {
-    colorResolution = dai::ColorCameraProperties::SensorResolution::THE_4_K;
-  }
+    auto colorCam = pipeline.create<dai::node::ColorCamera>();
+    colorCam->setResolution(dai::ColorCameraProperties::SensorResolution::THE_1080_P);
+    colorCam->setFps(colorFramerate);
+    colorCam->setPreviewSize(previewWidth, previewHeight);
+    colorCam->setInterleaved(false);
+    colorCam->setColorOrder(dai::ColorCameraProperties::ColorOrder::RGB);
 
-  colorCam->setResolution(colorResolution);
-  if (cResolution == "480p") {
-    colorCam->setVideoSize(848, 480);
-    colorCam->setIspScale(4, 5);
-  } else if (cResolution == "720p") {
-    colorCam->setVideoSize(1280, 720);
-    colorCam->setIspScale(2, 3);
-  } else if (cResolution == "1080p") {
-    colorCam->setVideoSize(1920, 1080);
-  } else {
-    colorCam->setVideoSize(3840, 2160);
-  }
+    auto h265Enc = pipeline.create<dai::node::VideoEncoder>();
+    h265Enc->setDefaultProfilePreset(colorCam->getFps(), dai::VideoEncoderProperties::Profile::H265_MAIN);
 
-  colorCam->setPreviewSize(previewWidth, previewHeight);
-  colorCam->setInterleaved(false);
-  colorCam->setColorOrder(dai::ColorCameraProperties::ColorOrder::BGR);
-  colorCam->setFps(cFramerate);
+    auto xoutVid = pipeline.create<dai::node::XLinkOut>();
+    xoutVid->setStreamName("h265_video");
+    h265Enc->bitstream.link(xoutVid->input);
+    colorCam->video.link(h265Enc->input);
 
-  auto h265Enc = pipeline.create<dai::node::VideoEncoder>();
-  auto xoutImg = pipeline.create<dai::node::XLinkOut>();
-  xoutImg->setStreamName("video");
-  xoutImg->input.setQueueSize(1);
-
-  h265Enc->setDefaultProfilePreset(
-    colorCam->getFps(), dai::VideoEncoderProperties::Profile::H265_MAIN);
-
-  colorCam->video.link(h265Enc->input);
-  h265Enc->bitstream.link(xoutImg->input);
-
-  return std::make_tuple(pipeline, 0, 0);
+    return std::make_tuple(pipeline, 1920, 1080);
 }
 
-int main(int argc, char ** argv)
-{
-  rclcpp::init(argc, argv);
-  auto node = std::make_shared<rclcpp::Node>("h265_decode_node");
+void decodeH265ToImage(AVCodecContext* codecCtx, AVFrame* frame, AVPacket* pkt, const std::vector<uint8_t>& buffer,
+                       const rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr& publisher) {
+    pkt->data = const_cast<uint8_t*>(buffer.data());
+    pkt->size = buffer.size();
 
-  std::string tfPrefix, monoResolution, colorResolution;
-  bool lrcheck, extended, subpixel;
-  bool useVideo, usePreview, useDepth;
-  int confidence, LRchecktresh, previewWidth, previewHeight, monoFramerate, colorFramerate;
-  float dotProjectormA, floodLightmA;
+    int ret = avcodec_send_packet(codecCtx, pkt);
+    if (ret < 0) {
+        RCLCPP_ERROR(rclcpp::get_logger("h265_decode_node"), "Error sending packet for decoding");
+        return;
+    }
 
-  node->declare_parameter("tf_prefix", "oak");
-  node->declare_parameter("lrcheck", true);
-  node->declare_parameter("extended", false);
-  node->declare_parameter("subpixel", true);
-  node->declare_parameter("confidence", 200);
-  node->declare_parameter("LRchecktresh", 5);
-  node->declare_parameter("monoResolution", "480p");
-  node->declare_parameter("monoFramerate", 30);
-  node->declare_parameter("colorResolution", "1080p");
-  node->declare_parameter("colorFramerate", 30);
-  node->declare_parameter("useVideo", true);
-  node->declare_parameter("usePreview", false);
-  node->declare_parameter("useDepth", true);
-  node->declare_parameter("previewWidth", 300);
-  node->declare_parameter("previewHeight", 300);
-  node->declare_parameter("dotProjectormA", 0.0f);
-  node->declare_parameter("floodLightmA", 0.0f);
+    while (ret >= 0) {
+        ret = avcodec_receive_frame(codecCtx, frame);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+            return;
+        } else if (ret < 0) {
+            RCLCPP_ERROR(rclcpp::get_logger("h265_decode_node"), "Error during decoding");
+            return;
+        }
 
-  node->get_parameter("tf_prefix", tfPrefix);
-  node->get_parameter("lrcheck", lrcheck);
-  node->get_parameter("extended", extended);
-  node->get_parameter("subpixel", subpixel);
-  node->get_parameter("confidence", confidence);
-  node->get_parameter("LRchecktresh", LRchecktresh);
-  node->get_parameter("monoResolution", monoResolution);
-  node->get_parameter("monoFramerate", monoFramerate);
-  node->get_parameter("colorResolution", colorResolution);
-  node->get_parameter("colorFramerate", colorFramerate);
-  node->get_parameter("useVideo", useVideo);
-  node->get_parameter("usePreview", usePreview);
-  node->get_parameter("useDepth", useDepth);
-  node->get_parameter("previewWidth", previewWidth);
-  node->get_parameter("previewHeight", previewHeight);
-  node->get_parameter("dotProjectormA", dotProjectormA);
-  node->get_parameter("floodLightmA", floodLightmA);
+        // Convert decoded frame to OpenCV Mat
+        int width = frame->width;
+        int height = frame->height;
 
-  int colorWidth, colorHeight;
-  if (colorResolution == "480p") {
-    colorWidth = 848;
-    colorHeight = 480;
-  } else if (colorResolution == "720p") {
-    colorWidth = 1280;
-    colorHeight = 720;
-  } else if (colorResolution == "1080p") {
-    colorWidth = 1920;
-    colorHeight = 1080;
-  } else if (colorResolution == "4K") {
-    colorWidth = 3840;
-    colorHeight = 2160;
-  } else {
-    RCLCPP_ERROR(
-      rclcpp::get_logger(
-        "rclcpp"), "Invalid parameter. -> colorResolution: %s", colorResolution.c_str());
-    throw std::runtime_error("Invalid color camera resolution.");
-  }
+        // Create a single matrix for YUV420P (I420) data
+        cv::Mat rawYUV(height * 3 / 2, width, CV_8UC1);
 
-  dai::Pipeline pipeline;
-  int monoWidth, monoHeight;
-  std::tie(pipeline, monoWidth, monoHeight) = createPipeline(
-    lrcheck, extended, subpixel, confidence, LRchecktresh, useVideo, usePreview, previewWidth,
-    previewHeight, monoResolution, colorResolution, monoFramerate, colorFramerate);
-  dai::Device device(pipeline);
-  
-  auto videoQueue = device.getOutputQueue("video", 30, false);
+        // Copy data from AVFrame to cv::Mat
+        uint8_t* mat_data = rawYUV.data;
+        // Copy Y plane
+        int y_data_size = height * frame->linesize[0];
+        memcpy(mat_data, frame->data[0], y_data_size);
+        
+        // Copy U plane
+        mat_data += y_data_size;
+        int u_data_size = (height / 2) * frame->linesize[1];
+        memcpy(mat_data, frame->data[1], u_data_size);
 
-  auto calibrationHandler = device.readCalibration();
+        // Copy V plane
+        mat_data += u_data_size;
+        int v_data_size = (height / 2) * frame->linesize[2];
+        memcpy(mat_data, frame->data[2], v_data_size);
 
-  auto boardName = calibrationHandler.getEepromData().boardName;
-  if (monoHeight > 480 && boardName == "OAK-D-LITE") {
-    monoWidth = 640;
-    monoHeight = 480;
-  }
+        // Convert YUV to BGR using the correct color conversion code
+        cv::Mat rawRGB(height, width, CV_8UC3);
 
-  std::unique_ptr<dai::rosBridge::BridgePublisher<sensor_msgs::msg::Image,
-    dai::ImgFrame>> depthPublish, rgbPreviewPublish, rgbPublish;
+        cv::cvtColor(rawYUV, rawRGB, cv::COLOR_YUV2RGB_YV12);
 
-  dai::rosBridge::ImageConverter rgbConverter(tfPrefix + "_rgb_camera_optical_frame", true);
+        // cv::Mat rawRGB(height, width, CV_8UC3);
+         
+        // cv::cvtColor(rawYUV, rawRGB, cv::COLOR_YUV420sp2RGB); // Convert YUV to BGR
 
-  auto videoCameraInfo = rgbConverter.calibrationToCameraInfo(
-    calibrationHandler,
-    dai::CameraBoardSocket::RGB,
-    colorWidth, colorHeight);
+        // Convert OpenCV Mat to ROS2 message
+        std_msgs::msg::Header header;
+        header.stamp = rclcpp::Clock().now();
+        header.frame_id = "camera_frame";
 
-  rgbPublish = std::make_unique<dai::rosBridge::BridgePublisher<sensor_msgs::msg::Image,
-      dai::ImgFrame>>(
-    videoQueue,
-    node,
-    std::string("color/video/image"),
-    std::bind(
-      &dai::rosBridge::ImageConverter::toRosMsg,
-      &rgbConverter,                  // since the converter has the same frame name
-                                      // and image type is also same we can reuse it
-      std::placeholders::_1,
-      std::placeholders::_2),
-    colorFramerate,
-    videoCameraInfo,
-    "color/video");
-  
-  rgbPublish->addPublisherCallback();
+        cv_bridge::CvImage cvImage(header, sensor_msgs::image_encodings::BGR8, rawRGB);
+        auto imgMsg = cvImage.toImageMsg();
 
-  rclcpp::spin(node);
-  rclcpp::shutdown();
-  return 0;
+        publisher->publish(*imgMsg);
+    }
+}
+
+int main(int argc, char** argv) {
+    rclcpp::init(argc, argv);
+    auto node = std::make_shared<rclcpp::Node>("h265_decode_node");
+
+    int previewWidth = node->declare_parameter<int>("preview_width", 640);
+    int previewHeight = node->declare_parameter<int>("preview_height", 480);
+    int colorFramerate = node->declare_parameter<int>("color_fps", 30);
+
+    dai::Pipeline pipeline;
+    int colorWidth, colorHeight;
+    std::tie(pipeline, colorWidth, colorHeight) = createPipeline(previewWidth, previewHeight, colorFramerate);
+
+    dai::Device device(pipeline);
+    auto videoQueue = device.getOutputQueue("h265_video", 30, false);
+
+    auto publisher = node->create_publisher<sensor_msgs::msg::Image>("color/image", 10);
+
+    AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_HEVC);
+    AVCodecContext* codecCtx = avcodec_alloc_context3(codec);
+    AVFrame* frame = av_frame_alloc();
+    AVPacket* pkt = av_packet_alloc();
+
+    if (avcodec_open2(codecCtx, codec, nullptr) < 0) {
+        RCLCPP_ERROR(rclcpp::get_logger("h265_decode_node"), "Could not open codec");
+        return -1;
+    }
+
+    auto timer_callback =
+        [videoQueue, publisher, codecCtx, frame, pkt]() -> void {
+        auto videoData = videoQueue->get<dai::ImgFrame>();
+        std::vector<uint8_t> buffer(videoData->getData().begin(), videoData->getData().end());
+
+        decodeH265ToImage(codecCtx, frame, pkt, buffer, publisher);
+    };
+
+    auto timer = node->create_wall_timer(std::chrono::milliseconds(1000 / colorFramerate), timer_callback);
+
+    rclcpp::spin(node);
+
+    avcodec_free_context(&codecCtx);
+    av_frame_free(&frame);
+    av_packet_free(&pkt);
+
+    rclcpp::shutdown();
+    return 0;
 }
