@@ -64,24 +64,36 @@ void decodeH265ToImage(AVCodecContext* codecCtx, AVFrame* frame, AVPacket* pkt, 
             return;
         }
 
-        // Convert decoded frame to OpenCV Mat
-        int width = frame->width;
-        int height = frame->height;
-        
-        cv::Mat rawYUV(height * 3 / 2, width, CV_8UC1);
+        AVFrame* sw_frame = frame;
+        #if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(56, 31, 100)
+        if (frame->format == AV_PIX_FMT_CUDA || frame->format == AV_PIX_FMT_VAAPI || frame->format == AV_PIX_FMT_QSV) {
+            sw_frame = av_frame_alloc();
+            if (av_hwframe_transfer_data(sw_frame, frame, 0) < 0) {
+                RCLCPP_ERROR(rclcpp::get_logger("h265_decode_node"), "Error transferring HW frame to system memory");
+                av_frame_free(&sw_frame);
+                continue;
+            }
+        }
+        #endif
 
-        // Copy data from AVFrame to cv::Mat
-        uint8_t* mat_data = rawYUV.data;
-        int y_data_size = height * frame->linesize[0];
-        memcpy(mat_data, frame->data[0], y_data_size);
-        
-        mat_data += y_data_size;
-        int u_data_size = (height / 2) * frame->linesize[1];
-        memcpy(mat_data, frame->data[1], u_data_size);
-
-        mat_data += u_data_size;
-        int v_data_size = (height / 2) * frame->linesize[2];
-        memcpy(mat_data, frame->data[2], v_data_size);
+        int width = sw_frame->width;
+        int height = sw_frame->height;
+        cv::Mat rawYUV;
+        // if (sw_frame->format == AV_PIX_FMT_YUV420P) {
+        //     rawYUV = cv::Mat(height * 3 / 2, width, CV_8UC1, sw_frame->data[0]);
+        // } else {
+            // fallback: copy data
+            rawYUV = cv::Mat(height * 3 / 2, width, CV_8UC1);
+            uint8_t* mat_data = rawYUV.data;
+            int y_data_size = height * sw_frame->linesize[0];
+            memcpy(mat_data, sw_frame->data[0], y_data_size);
+            mat_data += y_data_size;
+            int u_data_size = (height / 2) * sw_frame->linesize[1];
+            memcpy(mat_data, sw_frame->data[1], u_data_size);
+            mat_data += u_data_size;
+            int v_data_size = (height / 2) * sw_frame->linesize[2];
+            memcpy(mat_data, sw_frame->data[2], v_data_size);
+        // }
 
         cv::Mat rawRGB(height, width, CV_8UC3);
         cv::cvtColor(rawYUV, rawRGB, cv::COLOR_YUV2RGB_YV12);
@@ -92,6 +104,12 @@ void decodeH265ToImage(AVCodecContext* codecCtx, AVFrame* frame, AVPacket* pkt, 
         cv_bridge::CvImage cvImage(header, sensor_msgs::image_encodings::BGR8, rawRGB);
         auto imgMsg = cvImage.toImageMsg();
         publisher->publish(*imgMsg);
+
+        #if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(56, 31, 100)
+        if (sw_frame != frame) {
+            av_frame_free(&sw_frame);
+        }
+        #endif
     }
 }
 
@@ -122,7 +140,7 @@ int main(int argc, char** argv) {
     std::tie(pipeline, colorWidth, colorHeight) = createPipeline(previewWidth, previewHeight, colorFramerate);
     dai::Device device(pipeline);
     auto videoQueue = device.getOutputQueue("h265_video", 30, false);
-    auto publisher = node->create_publisher<sensor_msgs::msg::Image>("color/image", 10);
+    auto publisher = node->create_publisher<sensor_msgs::msg::Image>("color/video/image", 10);
 
     AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_HEVC);
     AVCodecContext* codecCtx = avcodec_alloc_context3(codec);
