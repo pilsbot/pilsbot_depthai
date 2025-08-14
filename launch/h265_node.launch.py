@@ -11,6 +11,11 @@ import launch_ros.descriptions
 
 
 def generate_launch_description():
+    hw_device_type = LaunchConfiguration('hw_device_type', default = 'none')
+    declare_hw_device_type_cmd = DeclareLaunchArgument(
+        'hw_device_type',
+        default_value=hw_device_type,
+        description='Hardware device type for ffmpeg/avcodec (e.g., none, cuda, vaapi, qsv)')
     # default_rviz = os.path.join(get_package_share_directory('depthai_examples'),
     #                             'rviz', 'pointCloud.rviz')
     urdf_launch_dir = os.path.join(get_package_share_directory('depthai_descriptions'), 'launch')
@@ -222,7 +227,8 @@ def generate_launch_description():
                         {'previewWidth': previewWidth},
                         {'previewHeight': previewHeight},
                         {'dotProjectormA': dotProjectormA},
-                        {'floodLightmA': floodLightmA}])
+                        {'floodLightmA': floodLightmA},
+                        {'hw_device_type': hw_device_type}])
 
     metric_converter_node = launch_ros.actions.ComposableNodeContainer(
             name='container',
@@ -300,6 +306,8 @@ def generate_launch_description():
 
     ld.add_action(declare_dotProjectormA_cmd)
     ld.add_action(declare_floodLightmA_cmd)
+
+    ld.add_action(declare_hw_device_type_cmd)
 
     ld.add_action(rgb_stereo_node)
     ld.add_action(urdf_launch)
