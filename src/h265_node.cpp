@@ -23,7 +23,7 @@ std::tuple<dai::Pipeline, int, int> createPipeline(int previewWidth, int preview
     colorCam->setFps(colorFramerate);
     colorCam->setPreviewSize(previewWidth, previewHeight);
     colorCam->setInterleaved(false);
-    colorCam->setColorOrder(dai::ColorCameraProperties::ColorOrder::RGB);
+    colorCam->setColorOrder(dai::ColorCameraProperties::ColorOrder::BGR);
     
     auto encoder = pipeline.create<dai::node::VideoEncoder>();
     if (video_codec == "h264")
@@ -34,7 +34,8 @@ std::tuple<dai::Pipeline, int, int> createPipeline(int previewWidth, int preview
     // encoder->setBitrateKbps(1500);
 
     auto xoutVid = pipeline.create<dai::node::XLinkOut>();
-    xoutVid->setStreamName("h265_video");
+    xoutVid->setStreamName("video");
+    xoutVid->input.queueSize(1);
     encoder->bitstream.link(xoutVid->input);
     colorCam->video.link(encoder->input);
 
@@ -53,7 +54,7 @@ AVPixelFormat get_hw_format(AVCodecContext* ctx, const AVPixelFormat* pix_fmts) 
     return AV_PIX_FMT_NONE;
 }
 
-void decodeH265ToImage(AVCodecContext* codecCtx, AVFrame* frame, AVPacket* pkt, AVFrame* colorFrame, uint64_t pts, const std::vector<uint8_t>& buffer,
+void decodeH265ToImage(AVCodecContext* codecCtx, AVFrame* frame, AVFrame* cpuFrame, AVPacket* pkt, AVFrame* colorFrame, uint64_t pts, const std::vector<uint8_t>& buffer,
                        const rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr& publisher) {
 
     if (buffer.empty()) {
@@ -96,7 +97,7 @@ void decodeH265ToImage(AVCodecContext* codecCtx, AVFrame* frame, AVPacket* pkt, 
     // if (pkt->data) {
     //     av_packet_unref(pkt);
     // }
-    if (av_new_packet(pkt, buffer.size() + AV_INPUT_BUFFER_PADDING_SIZE*2) < 0) {
+    if (av_new_packet(pkt, buffer.size() + AV_INPUT_BUFFER_PADDING_SIZE) < 0) {
         RCLCPP_ERROR(rclcpp::get_logger("h265_decode_node"), "Failed to allocate AVPacket");
         return;
     }
@@ -125,12 +126,13 @@ void decodeH265ToImage(AVCodecContext* codecCtx, AVFrame* frame, AVPacket* pkt, 
         AVFrame* sw_frame;
         #if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(56, 31, 100)
         if (frame->format == AV_PIX_FMT_CUDA || frame->format == AV_PIX_FMT_VAAPI || frame->format == AV_PIX_FMT_QSV) {
-            sw_frame = av_frame_alloc();
-            if (av_hwframe_transfer_data(sw_frame, frame, 0) < 0) {
+            // sw_frame = av_frame_alloc();
+            if (av_hwframe_transfer_data(cpuFrame, frame, 0) < 0) {
                 RCLCPP_ERROR(rclcpp::get_logger("h265_decode_node"), "Error transferring HW frame to system memory");
                 av_frame_free(&sw_frame);
                 continue;
             }
+            sw_frame = cpuFrame;
         }
         else {
             sw_frame = frame;
@@ -196,12 +198,13 @@ void decodeH265ToImage(AVCodecContext* codecCtx, AVFrame* frame, AVPacket* pkt, 
         //     publisher->publish(*imgMsg);
         //  }
 
-        #if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(56, 31, 100)
-        if (sw_frame != frame) {
-            av_frame_free(&sw_frame);
-        }
-        #endif
+        // #if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(56, 31, 100)
+        // if (sw_frame != frame) {
+        //     av_frame_free(&sw_frame);
+        // }
+        // #endif
     }
+    av_packet_unref(pkt);
 }
 
 int main(int argc, char** argv) {
@@ -270,6 +273,9 @@ int main(int argc, char** argv) {
         RCLCPP_ERROR(node->get_logger(), "Could not open codec");
         return -1;
     }
+    AVFrame* frame = av_frame_alloc();
+    AVPacket* pkt = av_packet_alloc();
+    AVFrame* cpuFrame = (hw_device_ctx == nullptr) ? nullptr : av_frame_alloc();
 
     std::atomic<bool> running{true};
     std::thread worker([&]() {
@@ -277,15 +283,11 @@ int main(int argc, char** argv) {
             std::lock_guard<std::mutex> lock(buffer_mutex);
             auto videoData = videoQueue->get<dai::ImgFrame>(); // blocks until frame available
             if (!videoData) continue;
-            std::vector<uint8_t> buffer(videoData->getData().begin(), videoData->getData().end());
-            AVFrame* frame = av_frame_alloc();
-            AVPacket* pkt = av_packet_alloc();
+            // std::vector<uint8_t> buffer(videoData->getData().begin(), videoData->getData().end());
             // Get PTS from dai::ImgFrame timestamp (in nanoseconds)
             auto ts = videoData->getTimestamp();
             uint64_t pts = std::chrono::duration_cast<std::chrono::nanoseconds>(ts.time_since_epoch()).count();
-            decodeH265ToImage(codecCtx, frame, pkt, colorFrame, pts, buffer, publisher);
-            av_frame_free(&frame);
-            av_packet_free(&pkt);
+            decodeH265ToImage(codecCtx, frame, cpuFrame, pkt, colorFrame, pts, videoData->getData(), publisher);
         }
     });
 
@@ -295,6 +297,10 @@ int main(int argc, char** argv) {
 
     avcodec_free_context(&codecCtx);
     av_buffer_unref(&hw_device_ctx);
+    av_frame_free(&frame);
+    av_frame_free(&cpuFrame);
+    av_frame_free(&colorFrame);
+    av_packet_free(&pkt);
     rclcpp::shutdown();
     return 0;
 }
