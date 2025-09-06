@@ -12,10 +12,15 @@ import launch_ros.descriptions
 
 def generate_launch_description():
     hw_device_type = LaunchConfiguration('hw_device_type', default = 'none')
+    video_codec    = LaunchConfiguration('video_codec',    default = 'h264')
     declare_hw_device_type_cmd = DeclareLaunchArgument(
         'hw_device_type',
         default_value=hw_device_type,
         description='Hardware device type for ffmpeg/avcodec (e.g., none, cuda, vaapi, qsv)')
+    declare_video_codec_cmd = DeclareLaunchArgument(
+        'video_codec',
+        default_value=video_codec,
+        description='Video codec to use (e.g., h264, h265)')
     # default_rviz = os.path.join(get_package_share_directory('depthai_examples'),
     #                             'rviz', 'pointCloud.rviz')
     urdf_launch_dir = os.path.join(get_package_share_directory('depthai_descriptions'), 'launch')
@@ -228,7 +233,8 @@ def generate_launch_description():
                         {'previewHeight': previewHeight},
                         {'dotProjectormA': dotProjectormA},
                         {'floodLightmA': floodLightmA},
-                        {'hw_device_type': hw_device_type}])
+                        {'hw_device_type': hw_device_type},
+                        {'video_codec': video_codec}])
 
     metric_converter_node = launch_ros.actions.ComposableNodeContainer(
             name='container',
