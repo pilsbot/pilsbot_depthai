@@ -1,9 +1,13 @@
+#include <mutex>
+#include <thread>
+#include <atomic>
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/opt.h>
+#include <libswscale/swscale.h>
 }
 
 #include <opencv2/opencv.hpp>
@@ -12,7 +16,7 @@ extern "C" {
 #include <sensor_msgs/msg/image.hpp>
 #include <depthai/depthai.hpp>
 
-std::tuple<dai::Pipeline, int, int> createPipeline(int previewWidth, int previewHeight, int colorFramerate) {
+std::tuple<dai::Pipeline, int, int> createPipeline(int previewWidth, int previewHeight, int colorFramerate, std::string video_codec) {
     dai::Pipeline pipeline;
     auto colorCam = pipeline.create<dai::node::ColorCamera>();
     colorCam->setResolution(dai::ColorCameraProperties::SensorResolution::THE_1080_P);
@@ -21,14 +25,19 @@ std::tuple<dai::Pipeline, int, int> createPipeline(int previewWidth, int preview
     colorCam->setInterleaved(false);
     colorCam->setColorOrder(dai::ColorCameraProperties::ColorOrder::RGB);
     
-    auto h265Enc = pipeline.create<dai::node::VideoEncoder>();
-    h265Enc->setDefaultProfilePreset(colorCam->getFps(), dai::VideoEncoderProperties::Profile::H265_MAIN);
-    
+    auto encoder = pipeline.create<dai::node::VideoEncoder>();
+    if (video_codec == "h264")
+        encoder->setDefaultProfilePreset(colorCam->getFps(), dai::VideoEncoderProperties::Profile::H264_MAIN);
+    else
+        encoder->setDefaultProfilePreset(colorCam->getFps(), dai::VideoEncoderProperties::Profile::H265_MAIN);
+    encoder->setKeyframeFrequency(colorFramerate*2);
+    // encoder->setBitrateKbps(1500);
+
     auto xoutVid = pipeline.create<dai::node::XLinkOut>();
     xoutVid->setStreamName("h265_video");
-    h265Enc->bitstream.link(xoutVid->input);
-    colorCam->video.link(h265Enc->input);
-    
+    encoder->bitstream.link(xoutVid->input);
+    colorCam->video.link(encoder->input);
+
     return std::make_tuple(pipeline, 1920, 1080);
 }
 
@@ -44,13 +53,61 @@ AVPixelFormat get_hw_format(AVCodecContext* ctx, const AVPixelFormat* pix_fmts) 
     return AV_PIX_FMT_NONE;
 }
 
-void decodeH265ToImage(AVCodecContext* codecCtx, AVFrame* frame, AVPacket* pkt, const std::vector<uint8_t>& buffer,
+void decodeH265ToImage(AVCodecContext* codecCtx, AVFrame* frame, AVPacket* pkt, AVFrame* colorFrame, uint64_t pts, const std::vector<uint8_t>& buffer,
                        const rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr& publisher) {
-    pkt->data = const_cast<uint8_t*>(buffer.data());
-    pkt->size = buffer.size();
+
+    if (buffer.empty()) {
+        // Don't send empty packets
+        return;
+    }
+
+    // Basic buffer validation: check for NAL start code (0x00 00 01 or 0x00 00 00 01)
+    bool has_nal_start = false;
+    for (size_t i = 0; i + 3 < buffer.size(); ++i) {
+        if ((buffer[i] == 0x00 && buffer[i+1] == 0x00 && buffer[i+2] == 0x01) ||
+            (i + 4 < buffer.size() && buffer[i] == 0x00 && buffer[i+1] == 0x00 && buffer[i+2] == 0x00 && buffer[i+3] == 0x01)) {
+            has_nal_start = true;
+            break;
+        }
+    }
+    if (!has_nal_start) {
+        RCLCPP_WARN(rclcpp::get_logger("h265_decode_node"), "Buffer does not contain a valid NAL start code. Skipping decode.");
+        return;
+    }
+
+    // Debug: print first 8 bytes and NAL unit types
+    std::ostringstream oss;
+    oss << "Buffer size: " << buffer.size() << ", first bytes: ";
+    for (size_t i = 0; i < std::min<size_t>(8, buffer.size()); ++i) {
+        oss << std::hex << std::setw(2) << std::setfill('0') << (int)buffer[i] << " ";
+    }
+    for (size_t i = 0; i + 5 < buffer.size(); ++i) {
+        if ((buffer[i] == 0x00 && buffer[i+1] == 0x00 && buffer[i+2] == 0x01) ||
+            (buffer[i] == 0x00 && buffer[i+1] == 0x00 && buffer[i+2] == 0x00 && buffer[i+3] == 0x01)) {
+            size_t nal_start = (buffer[i+2] == 0x01) ? i+3 : i+4;
+            uint8_t nal_unit_header = buffer[nal_start];
+            uint8_t nal_type = (nal_unit_header >> 1) & 0x3F;
+            oss << "[NAL type: " << (int)nal_type << "] ";
+        }
+    }
+    RCLCPP_DEBUG(rclcpp::get_logger("h265_decode_node"), "%s", oss.str().c_str());
+
+    // Allocate and copy buffer for AVPacket to avoid lifetime/corruption issues
+    // if (pkt->data) {
+    //     av_packet_unref(pkt);
+    // }
+    if (av_new_packet(pkt, buffer.size() + AV_INPUT_BUFFER_PADDING_SIZE*2) < 0) {
+        RCLCPP_ERROR(rclcpp::get_logger("h265_decode_node"), "Failed to allocate AVPacket");
+        return;
+    }
+    // Could we optimize it away to avoid this copy?
+    memcpy(pkt->data, buffer.data(), buffer.size());
+    pkt->pts = pts;
+    pkt->dts = pts;
 
     int ret = avcodec_send_packet(codecCtx, pkt);
     if (ret < 0) {
+        av_packet_unref(pkt);
         RCLCPP_ERROR(rclcpp::get_logger("h265_decode_node"), "Error sending packet for decoding");
         return;
     }
@@ -60,11 +117,12 @@ void decodeH265ToImage(AVCodecContext* codecCtx, AVFrame* frame, AVPacket* pkt, 
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
             return;
         } else if (ret < 0) {
+            av_packet_unref(pkt);
             RCLCPP_ERROR(rclcpp::get_logger("h265_decode_node"), "Error during decoding");
             return;
         }
 
-        AVFrame* sw_frame = frame;
+        AVFrame* sw_frame;
         #if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(56, 31, 100)
         if (frame->format == AV_PIX_FMT_CUDA || frame->format == AV_PIX_FMT_VAAPI || frame->format == AV_PIX_FMT_QSV) {
             sw_frame = av_frame_alloc();
@@ -74,36 +132,69 @@ void decodeH265ToImage(AVCodecContext* codecCtx, AVFrame* frame, AVPacket* pkt, 
                 continue;
             }
         }
+        else {
+            sw_frame = frame;
+        }
         #endif
 
         int width = sw_frame->width;
         int height = sw_frame->height;
-        cv::Mat rawYUV;
-        // if (sw_frame->format == AV_PIX_FMT_YUV420P) {
-        //     rawYUV = cv::Mat(height * 3 / 2, width, CV_8UC1, sw_frame->data[0]);
+        RCLCPP_DEBUG(rclcpp::get_logger("h265_decode_node"), "Decoded frame format: %d" 
+                   "x%d, pixel format: %s", width, height, av_get_pix_fmt_name((AVPixelFormat)sw_frame->format));
+        SwsContext* swsContext = sws_getContext(
+            width, height, (AVPixelFormat)sw_frame->format,
+            width, height, (AVPixelFormat)colorFrame->format,
+            SWS_FAST_BILINEAR | SWS_ACCURATE_RND, nullptr, nullptr, nullptr);
+        if (!swsContext) {
+            RCLCPP_ERROR(rclcpp::get_logger("h265_decode_node"), "cannot allocate sws context!");
+            return;
+        }
+
+        // bool libav = true;
+
+        // cv::Mat rawYUV = cv::Mat(height * 3 / 2, width, CV_8UC1);
+        // if (libav) {
+            sensor_msgs::msg::Image::SharedPtr image(new sensor_msgs::msg::Image());
+            image->height = frame->height;
+            image->width = frame->width;
+            image->step = image->width * 3;  // 3 bytes per pixel
+            image->encoding = sensor_msgs::image_encodings::BGR8;
+            image->data.resize(image->step * image->height);
+
+            av_image_fill_arrays(
+                colorFrame->data, colorFrame->linesize, &(image->data[0]),
+                (AVPixelFormat)colorFrame->format, sw_frame->width, sw_frame->height, 1);
+            sws_scale(
+                swsContext, sw_frame->data, sw_frame->linesize, 0,            // src
+                codecCtx->height, colorFrame->data, colorFrame->linesize);
+            publisher->publish(*image);
         // } else {
-            // fallback: copy data
-            rawYUV = cv::Mat(height * 3 / 2, width, CV_8UC1);
-            uint8_t* mat_data = rawYUV.data;
-            int y_data_size = height * sw_frame->linesize[0];
-            memcpy(mat_data, sw_frame->data[0], y_data_size);
-            mat_data += y_data_size;
-            int u_data_size = (height / 2) * sw_frame->linesize[1];
-            memcpy(mat_data, sw_frame->data[1], u_data_size);
-            mat_data += u_data_size;
-            int v_data_size = (height / 2) * sw_frame->linesize[2];
-            memcpy(mat_data, sw_frame->data[2], v_data_size);
-        // }
+        //     // fallback: copy data
+        //     rawYUV = cv::Mat(height * 3 / 2, width, CV_8UC1);
+        //     uint8_t* mat_data = rawYUV.data;
+        //     int y_data_size = height * sw_frame->linesize[0];
+        //     memcpy(mat_data, sw_frame->data[0], y_data_size);
+        //     mat_data += y_data_size;
+        //     int u_data_size = (height / 2) * sw_frame->linesize[1];
+        //     memcpy(mat_data, sw_frame->data[1], u_data_size);
+        //     mat_data += u_data_size;
+        //     int v_data_size = (height / 2) * sw_frame->linesize[2];
+        //     memcpy(mat_data, sw_frame->data[2], v_data_size);
 
-        cv::Mat rawRGB(height, width, CV_8UC3);
-        cv::cvtColor(rawYUV, rawRGB, cv::COLOR_YUV2RGB_YV12);
-
-        std_msgs::msg::Header header;
-        header.stamp = rclcpp::Clock().now();
-        header.frame_id = "camera_frame";
-        cv_bridge::CvImage cvImage(header, sensor_msgs::image_encodings::BGR8, rawRGB);
-        auto imgMsg = cvImage.toImageMsg();
-        publisher->publish(*imgMsg);
+        //     cv::Mat rawRGB(height, width, CV_8UC3);
+        //     if (sw_frame->format == AV_PIX_FMT_YUV420P) {
+        //         cv::cvtColor(rawYUV, rawRGB, cv::COLOR_YUV2RGB_YV12);
+        //     } else {
+        //         // Fallback for other YUV formats
+        //         cv::cvtColor(rawYUV, rawRGB, cv::COLOR_YUV2BGR_NV12);
+        //     }
+        //     std_msgs::msg::Header header;
+        //     header.stamp = rclcpp::Clock().now();
+        //     header.frame_id = "camera_frame";
+        //     cv_bridge::CvImage cvImage(header, sensor_msgs::image_encodings::BGR8, rawRGB);
+        //     auto imgMsg = cvImage.toImageMsg();
+        //     publisher->publish(*imgMsg);
+        //  }
 
         #if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(56, 31, 100)
         if (sw_frame != frame) {
@@ -121,6 +212,7 @@ int main(int argc, char** argv) {
     int previewHeight = node->declare_parameter<int>("preview_height", 480);
     int colorFramerate = node->declare_parameter<int>("color_fps", 30);
     std::string hw_device_type = node->declare_parameter<std::string>("hw_device_type", "none");
+    std::string video_codec = node->declare_parameter<std::string>("video_codec", "h264");
 
     if (hw_device_type != "none") {
         AVHWDeviceType device_type = av_hwdevice_find_type_by_name(hw_device_type.c_str());
@@ -135,17 +227,34 @@ int main(int argc, char** argv) {
         }
     }
 
+    AVCodec* codec = nullptr;
+    if (video_codec != "h264" && video_codec != "h265") {
+        RCLCPP_ERROR(node->get_logger(), "Unsupported video codec: %s. Use 'h264' or 'h265'.", video_codec.c_str());
+        return -1;
+    }
+    else if (video_codec == "h264") {
+        RCLCPP_INFO(node->get_logger(), "Using H.264 video codec.");
+        codec = avcodec_find_decoder(AV_CODEC_ID_H264);
+
+    }
+    else {
+        RCLCPP_INFO(node->get_logger(), "Using H.265 video codec.");
+        codec = avcodec_find_decoder(AV_CODEC_ID_H265);
+    }
+
+    AVCodecContext* codecCtx = avcodec_alloc_context3(codec);
+    AVFrame * colorFrame{NULL};
+    colorFrame = av_frame_alloc();
+    colorFrame->format = AV_PIX_FMT_BGR24;
+
     dai::Pipeline pipeline;
     int colorWidth, colorHeight;
-    std::tie(pipeline, colorWidth, colorHeight) = createPipeline(previewWidth, previewHeight, colorFramerate);
+    std::tie(pipeline, colorWidth, colorHeight) = createPipeline(previewWidth, previewHeight, colorFramerate, video_codec);
     dai::Device device(pipeline);
+
+    static std::mutex buffer_mutex;
     auto videoQueue = device.getOutputQueue("h265_video", 30, false);
     auto publisher = node->create_publisher<sensor_msgs::msg::Image>("color/video/image", 10);
-
-    AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_HEVC);
-    AVCodecContext* codecCtx = avcodec_alloc_context3(codec);
-    AVFrame* frame = av_frame_alloc();
-    AVPacket* pkt = av_packet_alloc();
 
     if (!codec || !codecCtx) {
         RCLCPP_ERROR(node->get_logger(), "Failed to allocate codec or codec context.");
@@ -162,19 +271,29 @@ int main(int argc, char** argv) {
         return -1;
     }
 
-    auto timer_callback =
-        [videoQueue, publisher, codecCtx, frame, pkt]() -> void {
-            auto videoData = videoQueue->get<dai::ImgFrame>();
+    std::atomic<bool> running{true};
+    std::thread worker([&]() {
+        while (running && rclcpp::ok()) {
+            std::lock_guard<std::mutex> lock(buffer_mutex);
+            auto videoData = videoQueue->get<dai::ImgFrame>(); // blocks until frame available
+            if (!videoData) continue;
             std::vector<uint8_t> buffer(videoData->getData().begin(), videoData->getData().end());
-            decodeH265ToImage(codecCtx, frame, pkt, buffer, publisher);
-        };
+            AVFrame* frame = av_frame_alloc();
+            AVPacket* pkt = av_packet_alloc();
+            // Get PTS from dai::ImgFrame timestamp (in nanoseconds)
+            auto ts = videoData->getTimestamp();
+            uint64_t pts = std::chrono::duration_cast<std::chrono::nanoseconds>(ts.time_since_epoch()).count();
+            decodeH265ToImage(codecCtx, frame, pkt, colorFrame, pts, buffer, publisher);
+            av_frame_free(&frame);
+            av_packet_free(&pkt);
+        }
+    });
 
-    auto timer = node->create_wall_timer(std::chrono::milliseconds(1000 / colorFramerate), timer_callback);
     rclcpp::spin(node);
+    running = false;
+    if (worker.joinable()) worker.join();
 
     avcodec_free_context(&codecCtx);
-    av_frame_free(&frame);
-    av_packet_free(&pkt);
     av_buffer_unref(&hw_device_ctx);
     rclcpp::shutdown();
     return 0;
