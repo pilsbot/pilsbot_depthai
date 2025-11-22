@@ -67,6 +67,7 @@ endmacro()
 
 dai_add_node_ros2(rgb_stereo_node src/rgb_stereo_node.cpp)
 dai_add_node_ros2(h265_node src/h265_node.cpp)
+dai_add_node_ros2(mjpeg_node src/mjpeg_node.cpp)
 
 
 if(BUILD_TESTING)
@@ -81,8 +82,9 @@ if(BUILD_TESTING)
 endif()
 
 install(TARGETS
-        rgb_stereo_node
-        h265_node
+  rgb_stereo_node
+  h265_node
+  mjpeg_node
         DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY launch/ DESTINATION share/${PROJECT_NAME}/launch
