@@ -29,6 +29,7 @@ namespace pilsbot_oakd
         ~MJPEGNode();
 
     private:
+        bool setup_gstreamer();
         void start_device();
         void stop_device();
         void worker_loop();
@@ -41,8 +42,6 @@ namespace pilsbot_oakd
         // Worker thread
         std::thread worker_;
         std::atomic<bool> running_{false};
-        mutable std::mutex mutex_;
-        mutable std::mutex gst_mutex_;
 
         // Optional GStreamer decoding (use hardware-accelerated decoder when available)
         bool use_gst_{false};
