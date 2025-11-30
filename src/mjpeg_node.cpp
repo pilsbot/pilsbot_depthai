@@ -171,7 +171,8 @@ namespace pilsbot_oakd
         }
 
         gst_appsrc_ = gst_element_factory_make("appsrc", "src");
-        GstElement *decoder = gst_element_factory_make("nvjpegdec", "decoder");
+        // FIXME: libjpeg (opencv) and libnvjpeg (nvjpegdec) share the same symbols and can not be used together!
+        GstElement *decoder = nullptr;  // gst_element_factory_make("nvjpegdec", "decoder");
         if (decoder)
         {
             RCLCPP_INFO(this->get_logger(), "Using nvjpegdec GStreamer decoder");
@@ -278,6 +279,7 @@ namespace pilsbot_oakd
                 bool decoded = false;
                 if (use_gst_ && gst_pipeline_ && gst_appsrc_ && gst_appsink_)
                 {
+                    // TODO: Only allocate this once.
                     GstBuffer *gst_buf = gst_buffer_new_allocate(NULL, buf.size(), NULL);
                     if (gst_buf)
                     {
