@@ -57,6 +57,7 @@ namespace pilsbot_oakd
         // parameters
         std::string output_topic_;
         std::string output_encoding_;
+        std::string nv_dec_;
         int preview_width_;
         int preview_height_;
         int color_fps_;

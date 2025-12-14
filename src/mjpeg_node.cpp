@@ -30,6 +30,8 @@ namespace pilsbot_oakd
         output_encoding_ = this->declare_parameter<std::string>("output_encoding", "bgr8");
         // Optionally try to use GStreamer-based decoding (hardware-accelerated on Jetson if plugin available)
         use_gst_ = this->declare_parameter<bool>("use_gstreamer", true);
+        nv_dec_ = this->declare_parameter<std::string>("nvdecoder", "");
+
     #ifndef HAVE_GSTREAMER
         if (use_gst_)
         {
@@ -61,9 +63,10 @@ namespace pilsbot_oakd
         // Build pipeline
         auto pipeline = std::make_shared<dai::Pipeline>();
         auto colorCam = pipeline->create<dai::node::ColorCamera>();
+        colorCam->setResolution(dai::ColorCameraProperties::SensorResolution::THE_1080_P);
         colorCam->setPreviewSize(preview_width_, preview_height_);
         colorCam->setInterleaved(false);
-        colorCam->setColorOrder(dai::ColorCameraProperties::ColorOrder::BGR);
+        colorCam->setColorOrder(dai::ColorCameraProperties::ColorOrder::RGB);
         colorCam->setFps(color_fps_);
 
         auto encoder = pipeline->create<dai::node::VideoEncoder>();
@@ -171,25 +174,51 @@ namespace pilsbot_oakd
         }
 
         gst_appsrc_ = gst_element_factory_make("appsrc", "src");
-        // FIXME: libjpeg (opencv) and libnvjpeg (nvjpegdec) share the same symbols and can not be used together!
-        GstElement *decoder = nullptr;  // gst_element_factory_make("nvjpegdec", "decoder");
-        if (decoder)
+
+        GstElement *decoder = nullptr;
+        GstElement *jpegparse = nullptr;
+        bool want_jpegparse = false;
+        if (nv_dec_ == "nvjpegdec")
         {
-            RCLCPP_INFO(this->get_logger(), "Using nvjpegdec GStreamer decoder");
+            decoder = gst_element_factory_make("nvjpegdec", "decoder");
+        }
+        else if (nv_dec_ == "nvv4l2decoder")
+        {
+            /* nvv4l2decoder often requires a jpegparse upstream */
+            want_jpegparse = true;
+            decoder = gst_element_factory_make("nvv4l2decoder", "decoder");
+            if (decoder) {
+                g_object_set(G_OBJECT(decoder), "mjpeg", TRUE, nullptr);
+            }
         }
         else
         {
-            RCLCPP_WARN(this->get_logger(), "Could not use nvjpegdec GStreamer decoder!");
+            RCLCPP_WARN(this->get_logger(), "No specific NV decoder requested (nv_dec_='%s')", nv_dec_.c_str());
+            RCLCPP_WARN(this->get_logger(), "Defaulting to software jpegdec GStreamer decoder");
+            decoder = gst_element_factory_make("jpegdec", "decoder");
+        }
+
+        if (!decoder)
+        {
+            RCLCPP_WARN(this->get_logger(), "Could not create requested NV decoder; falling back to software jpegdec");
             decoder = gst_element_factory_make("jpegdec", "decoder");
             if (decoder)
             {
                 RCLCPP_INFO(this->get_logger(), "Using jpegdec GStreamer decoder");
             }
         }
-        if (!decoder)
+
+        if (want_jpegparse)
         {
-            RCLCPP_WARN(this->get_logger(), "Could also not use jpecdec GStreamer decoder!");
-            return false;
+            jpegparse = gst_element_factory_make("jpegparse", "jpegparse");
+            if (jpegparse)
+            {
+                RCLCPP_DEBUG(this->get_logger(), "Created jpegparse element to assist hardware decoder");
+            }
+            else
+            {
+                RCLCPP_WARN(this->get_logger(), "Requested jpegparse but could not create element");
+            }
         }
 
         GstElement *videoconvert = gst_element_factory_make("videoconvert", "conv");
@@ -207,6 +236,11 @@ namespace pilsbot_oakd
             {
                 gst_object_unref(gst_appsrc_);
                 gst_appsrc_ = nullptr;
+            }
+            if (jpegparse)
+            {
+                gst_object_unref(jpegparse);
+                jpegparse = nullptr;
             }
             if (decoder)
             {
@@ -226,27 +260,52 @@ namespace pilsbot_oakd
             return false;
         }
 
-        gst_bin_add_many(GST_BIN(gst_pipeline_), gst_appsrc_, decoder, videoconvert, gst_appsink_, nullptr);
-        if (!gst_element_link(gst_appsrc_, decoder) || !gst_element_link(decoder, videoconvert) || !gst_element_link(videoconvert, gst_appsink_))
+        if (jpegparse)
         {
-            RCLCPP_WARN(this->get_logger(), "Failed to link GStreamer elements; disabling GStreamer path");
-            gst_object_unref(gst_pipeline_);
-            gst_pipeline_ = nullptr;
-            // TODO: Free other stuff?
-            return false;
+            gst_bin_add_many(GST_BIN(gst_pipeline_), gst_appsrc_, jpegparse, decoder, videoconvert, gst_appsink_, nullptr);
+            if (!gst_element_link(gst_appsrc_, jpegparse) || !gst_element_link(jpegparse, decoder) || !gst_element_link(decoder, videoconvert) || !gst_element_link(videoconvert, gst_appsink_))
+            {
+                RCLCPP_WARN(this->get_logger(), "Failed to link GStreamer elements with jpegparse; disabling GStreamer path");
+                gst_object_unref(gst_pipeline_);
+                gst_pipeline_ = nullptr;
+                return false;
+            }
+            else
+            {
+                RCLCPP_DEBUG(this->get_logger(), "Linked appsrc -> jpegparse -> decoder -> videoconvert -> appsink");
+            }
+        }
+        else
+        {
+            gst_bin_add_many(GST_BIN(gst_pipeline_), gst_appsrc_, decoder, videoconvert, gst_appsink_, nullptr);
+            if (!gst_element_link(gst_appsrc_, decoder) || !gst_element_link(decoder, videoconvert) || !gst_element_link(videoconvert, gst_appsink_))
+            {
+                RCLCPP_WARN(this->get_logger(), "Failed to link GStreamer elements; disabling GStreamer path");
+                gst_object_unref(gst_pipeline_);
+                gst_pipeline_ = nullptr;
+                return false;
+            }
+            else
+            {
+                RCLCPP_DEBUG(this->get_logger(), "Linked appsrc -> decoder -> videoconvert -> appsink");
+            }
         }
 
         // configure appsrc and appsink caps
-        GstCaps *src_caps = gst_caps_from_string("image/jpeg");
+        GstCaps *src_caps = gst_caps_from_string(
+            "image/jpeg, width=1920, height=1080, pixel-aspect-ratio=1/1, framerate=30/1"
+        );
         g_object_set(G_OBJECT(gst_appsrc_), "caps", src_caps, "format", GST_FORMAT_TIME, nullptr);
         gst_caps_unref(src_caps);
 
-        GstCaps *sink_caps = gst_caps_from_string("video/x-raw,format=BGR");
+        GstCaps *sink_caps = gst_caps_from_string(
+            "video/x-raw,format=BGR,width=1920,height=1080,pixel-aspect-ratio=1/1,framerate=30/1"
+        );
         g_object_set(G_OBJECT(gst_appsink_), "caps", sink_caps, "emit-signals", FALSE, "max-buffers", 1, "drop", TRUE, nullptr);
         gst_caps_unref(sink_caps);
 
         sret = gst_element_set_state(gst_pipeline_, GST_STATE_PLAYING);
-        if (sret == GST_STATE_CHANGE_FAILURE)
+        if (sret == GST_STATE_CHANGE_FAILURE || sret == GST_STATE_CHANGE_ASYNC)
         {
             RCLCPP_WARN(this->get_logger(), "Failed to set GStreamer pipeline to PLAYING; disabling GStreamer path");
             gst_element_set_state(gst_pipeline_, GST_STATE_NULL);
@@ -280,54 +339,92 @@ namespace pilsbot_oakd
                 if (use_gst_ && gst_pipeline_ && gst_appsrc_ && gst_appsink_)
                 {
                     // TODO: Only allocate this once.
+                    RCLCPP_DEBUG(this->get_logger(), "GStreamer path enabled: attempting to decode %zu bytes", buf.size());
                     GstBuffer *gst_buf = gst_buffer_new_allocate(NULL, buf.size(), NULL);
-                    if (gst_buf)
+                    if (!gst_buf)
+                    {
+                        RCLCPP_WARN(this->get_logger(), "gst_buffer_new_allocate returned NULL for size %zu", buf.size());
+                    }
+                    else
                     {
                         GstMapInfo map;
-                        if (gst_buffer_map(gst_buf, &map, GST_MAP_WRITE))
+                        if (!gst_buffer_map(gst_buf, &map, GST_MAP_WRITE))
+                        {
+                            RCLCPP_WARN(this->get_logger(), "gst_buffer_map (write) failed for input buffer");
+                        }
+                        else
                         {
                             memcpy(map.data, buf.data(), buf.size());
                             gst_buffer_unmap(gst_buf, &map);
+                            RCLCPP_DEBUG(this->get_logger(), "Copied %zu bytes into gst buffer", buf.size());
                         }
 
                         GstFlowReturn fret = gst_app_src_push_buffer(GST_APP_SRC(gst_appsrc_), gst_buf);
+                        RCLCPP_DEBUG(this->get_logger(), "gst_app_src_push_buffer returned %d", (int)fret);
                         if (fret == GST_FLOW_OK)
                         {
-                            GstSample *sample = gst_app_sink_try_pull_sample(GST_APP_SINK(gst_appsink_), GST_MSECOND * 500);
+                            GstSample *sample = gst_app_sink_try_pull_sample(GST_APP_SINK(gst_appsink_), GST_MSECOND * 1000);
                             if (!sample)
                             {
-                                // try blocking pull briefly
+                                RCLCPP_DEBUG(this->get_logger(), "gst_app_sink_try_pull_sample returned NULL; trying blocking pull");
                                 sample = gst_app_sink_pull_sample(GST_APP_SINK(gst_appsink_));
                             }
-                            if (sample)
+                            if (!sample)
+                            {
+                                RCLCPP_WARN(this->get_logger(), "GStreamer did not return a sample after push (NULL)");
+                            }
+                            else
                             {
                                 GstBuffer *outbuf = gst_sample_get_buffer(sample);
-                                GstMapInfo outmap;
-                                if (gst_buffer_map(outbuf, &outmap, GST_MAP_READ))
+                                if (!outbuf)
                                 {
-                                    GstCaps *caps = gst_sample_get_caps(sample);
-                                    int width = 0, height = 0;
-                                    if (caps)
+                                    RCLCPP_WARN(this->get_logger(), "gst_sample_get_buffer returned NULL");
+                                }
+                                else
+                                {
+                                    GstMapInfo outmap;
+                                    if (!gst_buffer_map(outbuf, &outmap, GST_MAP_READ))
                                     {
-                                        GstStructure *s = gst_caps_get_structure(caps, 0);
-                                        gst_structure_get_int(s, "width", &width);
-                                        gst_structure_get_int(s, "height", &height);
+                                        RCLCPP_WARN(this->get_logger(), "gst_buffer_map (read) failed on output buffer");
                                     }
-                                    if (width > 0 && height > 0)
+                                    else
                                     {
-                                        // TODO: Can we get rid of that copy?
-                                        cv::Mat tmp(height, width, CV_8UC3, (void *)outmap.data);
-                                        tmp.copyTo(mat);
-                                        decoded = true;
+                                        GstCaps *caps = gst_sample_get_caps(sample);
+                                        int width = 0, height = 0;
+                                        const gchar *fmt = nullptr;
+                                        if (caps)
+                                        {
+                                            GstStructure *s = gst_caps_get_structure(caps, 0);
+                                            fmt = gst_structure_get_string(s, "format");
+                                            gst_structure_get_int(s, "width", &width);
+                                            gst_structure_get_int(s, "height", &height);
+                                            RCLCPP_DEBUG(this->get_logger(), "GStreamer output caps: format=%s width=%d height=%d", fmt ? fmt : "unknown", width, height);
+                                        }
+                                        else
+                                        {
+                                            RCLCPP_DEBUG(this->get_logger(), "GStreamer sample has no caps");
+                                        }
+
+                                        if (width > 0 && height > 0 && outmap.data)
+                                        {
+                                            cv::Mat tmp(height, width, CV_8UC3, (void *)outmap.data);
+                                            tmp.copyTo(mat);
+                                            decoded = true;
+                                            RCLCPP_DEBUG(this->get_logger(), "Decoded image via GStreamer: %dx%d format=%s", height, width, fmt ? fmt : "?");
+                                        }
+                                        else
+                                        {
+                                            RCLCPP_WARN(this->get_logger(), "GStreamer returned sample but invalid dimensions or data (w=%d h=%d data=%p)", width, height, outmap.data);
+                                        }
+                                        gst_buffer_unmap(outbuf, &outmap);
                                     }
-                                    gst_buffer_unmap(outbuf, &outmap);
                                 }
                                 gst_sample_unref(sample);
                             }
                         }
                         else
                         {
-                            // the buffer was consumed/freed by GStreamer on push or push failed
+                            RCLCPP_WARN(this->get_logger(), "gst_app_src_push_buffer returned flow %d (not GST_FLOW_OK)", (int)fret);
                         }
                     }
                 }
@@ -337,15 +434,25 @@ namespace pilsbot_oakd
                     {
                         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "GStreamer failed to decode a frame; falling back to cv::imdecode");
                         use_gst_ = false;
-                        // TODO: Free all stuff
+                    }
+                    else
+                    {
+                        RCLCPP_DEBUG(this->get_logger(), "GStreamer path disabled; using cv::imdecode");
                     }
                 }
 #endif
-                mat = cv::imdecode(buf, cv::IMREAD_COLOR);
                 if (mat.empty())
                 {
-                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "Failed to decode MJPEG frame");
-                    continue;
+                    mat = cv::imdecode(buf, cv::IMREAD_COLOR);
+                    if (mat.empty())
+                    {
+                        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "Failed to decode MJPEG frame via cv::imdecode as well");
+                        continue;
+                    }
+                    else
+                    {
+                        RCLCPP_DEBUG(this->get_logger(), "Decoded image via cv::imdecode: %dx%d", mat.rows, mat.cols);
+                    }
                 }
 
                 // Convert to ROS Image
