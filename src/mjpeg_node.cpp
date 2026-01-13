@@ -221,7 +221,37 @@ namespace pilsbot_oakd
             }
         }
 
+        // Try hardware-accelerated nvvidconv first (for NVMM buffer handling on Jetson),
+        // fall back to software videoconvert if unavailable
+        GstElement *nvvidconv = gst_element_factory_make("nvvidconv", "nvconv");
+        bool using_nvvidconv = (nvvidconv != nullptr);
+        if (nvvidconv)
+        {
+            RCLCPP_INFO(this->get_logger(), "Using nvvidconv for hardware-accelerated NVMM to system memory conversion");
+        }
+        else
+        {
+            RCLCPP_WARN(this->get_logger(), "nvvidconv not available; will use software videoconvert only");
+        }
+
+        // Software videoconvert is always needed for final BGR conversion
+        // (nvvidconv outputs I420/NV12, not BGR)
         GstElement *videoconvert = gst_element_factory_make("videoconvert", "conv");
+
+        // Capsfilter for NVMM memory between decoder and nvvidconv (only needed for HW path)
+        GstElement *nvmm_capsfilter = nullptr;
+        if (using_nvvidconv && (nv_dec_ == "nvv4l2decoder" || nv_dec_ == "nvjpegdec"))
+        {
+            nvmm_capsfilter = gst_element_factory_make("capsfilter", "nvmm_caps");
+            if (nvmm_capsfilter)
+            {
+                GstCaps *nvmm_caps = gst_caps_from_string("video/x-raw(memory:NVMM)");
+                g_object_set(G_OBJECT(nvmm_capsfilter), "caps", nvmm_caps, nullptr);
+                gst_caps_unref(nvmm_caps);
+                RCLCPP_DEBUG(this->get_logger(), "Created NVMM capsfilter for hardware decoder path");
+            }
+        }
+
         gst_appsink_ = gst_element_factory_make("appsink", "sink");
 
         if (!gst_appsrc_ || !decoder || !videoconvert || !gst_appsink_)
@@ -247,10 +277,20 @@ namespace pilsbot_oakd
                 gst_object_unref(decoder);
                 decoder = nullptr;
             }
+            if (nvvidconv)
+            {
+                gst_object_unref(nvvidconv);
+                nvvidconv = nullptr;
+            }
             if (videoconvert)
             {
                 gst_object_unref(videoconvert);
                 videoconvert = nullptr;
+            }
+            if (nvmm_capsfilter)
+            {
+                gst_object_unref(nvmm_capsfilter);
+                nvmm_capsfilter = nullptr;
             }
             if (gst_appsink_)
             {
@@ -260,62 +300,133 @@ namespace pilsbot_oakd
             return false;
         }
 
+        // Build caps dynamically from node parameters
+        char src_caps_str[256];
+        snprintf(src_caps_str, sizeof(src_caps_str),
+            "image/jpeg, width=%d, height=%d, pixel-aspect-ratio=1/1, framerate=%d/1",
+            1920, 1080, color_fps_);
+        GstCaps *src_caps = gst_caps_from_string(src_caps_str);
+        // Configure appsrc as a live source (stream-type=0 means GST_APP_STREAM_TYPE_STREAM)
+        // This prevents the pipeline from blocking on preroll waiting for data
+        g_object_set(G_OBJECT(gst_appsrc_),
+            "caps", src_caps,
+            "format", GST_FORMAT_TIME,
+            "stream-type", 0,  // GST_APP_STREAM_TYPE_STREAM
+            "is-live", TRUE,
+            "do-timestamp", TRUE,
+            nullptr);
+        gst_caps_unref(src_caps);
+        RCLCPP_DEBUG(this->get_logger(), "Appsrc caps: %s (live source)", src_caps_str);
+
+        char sink_caps_str[256];
+        snprintf(sink_caps_str, sizeof(sink_caps_str),
+            "video/x-raw,format=BGR,width=%d,height=%d,pixel-aspect-ratio=1/1,framerate=%d/1",
+            1920, 1080, color_fps_);
+        GstCaps *sink_caps = gst_caps_from_string(sink_caps_str);
+        // Configure appsink: async=false allows pipeline to start without waiting for preroll
+        g_object_set(G_OBJECT(gst_appsink_),
+            "caps", sink_caps,
+            "emit-signals", FALSE,
+            "max-buffers", 1,
+            "drop", TRUE,
+            "sync", FALSE,  // Don't sync to clock (we handle timing)
+            nullptr);
+        gst_caps_unref(sink_caps);
+        RCLCPP_DEBUG(this->get_logger(), "Appsink caps: %s", sink_caps_str);
+
+        // Link pipeline elements based on configuration
+        // Hardware path: appsrc -> [jpegparse ->] decoder -> nvmm_caps -> nvvidconv -> videoconvert -> appsink
+        // Software path: appsrc -> [jpegparse ->] decoder -> videoconvert -> appsink
+        bool link_ok = false;
         if (jpegparse)
         {
-            gst_bin_add_many(GST_BIN(gst_pipeline_), gst_appsrc_, jpegparse, decoder, videoconvert, gst_appsink_, nullptr);
-            if (!gst_element_link(gst_appsrc_, jpegparse) || !gst_element_link(jpegparse, decoder) || !gst_element_link(decoder, videoconvert) || !gst_element_link(videoconvert, gst_appsink_))
+            if (nvmm_capsfilter && nvvidconv)
             {
-                RCLCPP_WARN(this->get_logger(), "Failed to link GStreamer elements with jpegparse; disabling GStreamer path");
-                gst_object_unref(gst_pipeline_);
-                gst_pipeline_ = nullptr;
-                return false;
+                gst_bin_add_many(GST_BIN(gst_pipeline_), gst_appsrc_, jpegparse, decoder, nvmm_capsfilter, nvvidconv, videoconvert, gst_appsink_, nullptr);
+                link_ok = gst_element_link(gst_appsrc_, jpegparse) &&
+                          gst_element_link(jpegparse, decoder) &&
+                          gst_element_link(decoder, nvmm_capsfilter) &&
+                          gst_element_link(nvmm_capsfilter, nvvidconv) &&
+                          gst_element_link(nvvidconv, videoconvert) &&
+                          gst_element_link(videoconvert, gst_appsink_);
+                if (link_ok)
+                {
+                    RCLCPP_DEBUG(this->get_logger(), "Linked appsrc -> jpegparse -> decoder -> nvmm_caps -> nvvidconv -> videoconvert -> appsink");
+                }
             }
             else
             {
-                RCLCPP_DEBUG(this->get_logger(), "Linked appsrc -> jpegparse -> decoder -> videoconvert -> appsink");
+                gst_bin_add_many(GST_BIN(gst_pipeline_), gst_appsrc_, jpegparse, decoder, videoconvert, gst_appsink_, nullptr);
+                link_ok = gst_element_link(gst_appsrc_, jpegparse) &&
+                          gst_element_link(jpegparse, decoder) &&
+                          gst_element_link(decoder, videoconvert) &&
+                          gst_element_link(videoconvert, gst_appsink_);
+                if (link_ok)
+                {
+                    RCLCPP_DEBUG(this->get_logger(), "Linked appsrc -> jpegparse -> decoder -> videoconvert -> appsink");
+                }
             }
         }
         else
         {
-            gst_bin_add_many(GST_BIN(gst_pipeline_), gst_appsrc_, decoder, videoconvert, gst_appsink_, nullptr);
-            if (!gst_element_link(gst_appsrc_, decoder) || !gst_element_link(decoder, videoconvert) || !gst_element_link(videoconvert, gst_appsink_))
+            if (nvmm_capsfilter && nvvidconv)
             {
-                RCLCPP_WARN(this->get_logger(), "Failed to link GStreamer elements; disabling GStreamer path");
-                gst_object_unref(gst_pipeline_);
-                gst_pipeline_ = nullptr;
-                return false;
+                gst_bin_add_many(GST_BIN(gst_pipeline_), gst_appsrc_, decoder, nvmm_capsfilter, nvvidconv, videoconvert, gst_appsink_, nullptr);
+                link_ok = gst_element_link(gst_appsrc_, decoder) &&
+                          gst_element_link(decoder, nvmm_capsfilter) &&
+                          gst_element_link(nvmm_capsfilter, nvvidconv) &&
+                          gst_element_link(nvvidconv, videoconvert) &&
+                          gst_element_link(videoconvert, gst_appsink_);
+                if (link_ok)
+                {
+                    RCLCPP_DEBUG(this->get_logger(), "Linked appsrc -> decoder -> nvmm_caps -> nvvidconv -> videoconvert -> appsink");
+                }
             }
             else
             {
-                RCLCPP_DEBUG(this->get_logger(), "Linked appsrc -> decoder -> videoconvert -> appsink");
+                gst_bin_add_many(GST_BIN(gst_pipeline_), gst_appsrc_, decoder, videoconvert, gst_appsink_, nullptr);
+                link_ok = gst_element_link(gst_appsrc_, decoder) &&
+                          gst_element_link(decoder, videoconvert) &&
+                          gst_element_link(videoconvert, gst_appsink_);
+                if (link_ok)
+                {
+                    RCLCPP_DEBUG(this->get_logger(), "Linked appsrc -> decoder -> videoconvert -> appsink");
+                }
             }
         }
 
-        // configure appsrc and appsink caps
-        GstCaps *src_caps = gst_caps_from_string(
-            "image/jpeg, width=1920, height=1080, pixel-aspect-ratio=1/1, framerate=30/1"
-        );
-        g_object_set(G_OBJECT(gst_appsrc_), "caps", src_caps, "format", GST_FORMAT_TIME, nullptr);
-        gst_caps_unref(src_caps);
-
-        GstCaps *sink_caps = gst_caps_from_string(
-            "video/x-raw,format=BGR,width=1920,height=1080,pixel-aspect-ratio=1/1,framerate=30/1"
-        );
-        g_object_set(G_OBJECT(gst_appsink_), "caps", sink_caps, "emit-signals", FALSE, "max-buffers", 1, "drop", TRUE, nullptr);
-        gst_caps_unref(sink_caps);
-
-        sret = gst_element_set_state(gst_pipeline_, GST_STATE_PLAYING);
-        if (sret == GST_STATE_CHANGE_FAILURE || sret == GST_STATE_CHANGE_ASYNC)
+        if (!link_ok)
         {
-            RCLCPP_WARN(this->get_logger(), "Failed to set GStreamer pipeline to PLAYING; disabling GStreamer path");
+            RCLCPP_WARN(this->get_logger(), "Failed to link GStreamer elements; disabling GStreamer path");
             gst_element_set_state(gst_pipeline_, GST_STATE_NULL);
             gst_object_unref(gst_pipeline_);
             gst_pipeline_ = nullptr;
-            // TODO: Free other stuff?
             return false;
         }
 
-        RCLCPP_INFO(this->get_logger(), "GStreamer JPEG decoder initialized (use_gst_=true)");
+        sret = gst_element_set_state(gst_pipeline_, GST_STATE_PLAYING);
+        if (sret == GST_STATE_CHANGE_FAILURE)
+        {
+            RCLCPP_WARN(this->get_logger(), "Failed to set GStreamer pipeline to PLAYING (immediate failure); disabling GStreamer path");
+            gst_element_set_state(gst_pipeline_, GST_STATE_NULL);
+            gst_object_unref(gst_pipeline_);
+            gst_pipeline_ = nullptr;
+            return false;
+        }
+        else if (sret == GST_STATE_CHANGE_ASYNC)
+        {
+            // For live sources, ASYNC is expected - the pipeline will complete state change
+            // once we start pushing data. Don't wait, just proceed.
+            RCLCPP_INFO(this->get_logger(), "GStreamer pipeline state change is async (normal for live source)");
+        }
+        else if (sret == GST_STATE_CHANGE_NO_PREROLL)
+        {
+            // NO_PREROLL is also expected for live sources - means pipeline is ready
+            RCLCPP_INFO(this->get_logger(), "GStreamer pipeline ready (no preroll, live source)");
+        }
+
+        RCLCPP_INFO(this->get_logger(), "GStreamer JPEG decoder initialized (use_gst_=true, nvvidconv=%s)",
+            using_nvvidconv ? "yes" : "no");
         return true;
 #endif
     }
