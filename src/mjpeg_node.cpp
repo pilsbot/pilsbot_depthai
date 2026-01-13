@@ -3,7 +3,9 @@
 #include "pilsbot_oakd/mjpeg_node.hpp"
 
 #include <chrono>
+#include <cstring>
 #include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
 #include <depthai/depthai.hpp>
 #include <atomic>
 #include <thread>
@@ -234,9 +236,21 @@ namespace pilsbot_oakd
             RCLCPP_WARN(this->get_logger(), "nvvidconv not available; will use software videoconvert only");
         }
 
-        // Software videoconvert is always needed for final BGR conversion
-        // (nvvidconv outputs I420/NV12, not BGR)
-        GstElement *videoconvert = gst_element_factory_make("videoconvert", "conv");
+        // Software videoconvert only needed when nvvidconv is not available
+        // When nvvidconv is available, we output I420 and use OpenCV cvtColor (faster than GStreamer videoconvert)
+        GstElement *videoconvert = nullptr;
+        if (!using_nvvidconv)
+        {
+            videoconvert = gst_element_factory_make("videoconvert", "conv");
+        }
+
+        // Add queue element after decoder for buffering and parallel processing
+        GstElement *queue = gst_element_factory_make("queue", "queue");
+        if (queue)
+        {
+            // Small queue to reduce latency while still allowing parallelism
+            g_object_set(G_OBJECT(queue), "max-size-buffers", 2, "max-size-time", (guint64)0, "max-size-bytes", 0, nullptr);
+        }
 
         // Capsfilter for NVMM memory between decoder and nvvidconv (only needed for HW path)
         GstElement *nvmm_capsfilter = nullptr;
@@ -254,7 +268,9 @@ namespace pilsbot_oakd
 
         gst_appsink_ = gst_element_factory_make("appsink", "sink");
 
-        if (!gst_appsrc_ || !decoder || !videoconvert || !gst_appsink_)
+        // Check required elements - videoconvert only required when not using nvvidconv
+        bool have_converter = using_nvvidconv ? (nvvidconv != nullptr) : (videoconvert != nullptr);
+        if (!gst_appsrc_ || !decoder || !have_converter || !gst_appsink_)
         {
             RCLCPP_WARN(this->get_logger(), "Incomplete GStreamer element set, disabling GStreamer path");
             if (gst_pipeline_)
@@ -292,6 +308,11 @@ namespace pilsbot_oakd
                 gst_object_unref(nvmm_capsfilter);
                 nvmm_capsfilter = nullptr;
             }
+            if (queue)
+            {
+                gst_object_unref(queue);
+                queue = nullptr;
+            }
             if (gst_appsink_)
             {
                 gst_object_unref(gst_appsink_);
@@ -318,10 +339,13 @@ namespace pilsbot_oakd
         gst_caps_unref(src_caps);
         RCLCPP_DEBUG(this->get_logger(), "Appsrc caps: %s (live source)", src_caps_str);
 
+        // For hardware path (nvvidconv), output I420 - we'll convert to BGR with OpenCV (faster)
+        // For software path, output BGR directly via videoconvert
         char sink_caps_str[256];
+        const char *output_format = using_nvvidconv ? "I420" : "BGR";
         snprintf(sink_caps_str, sizeof(sink_caps_str),
-            "video/x-raw,format=BGR,width=%d,height=%d,pixel-aspect-ratio=1/1,framerate=%d/1",
-            1920, 1080, color_fps_);
+            "video/x-raw,format=%s,width=%d,height=%d,pixel-aspect-ratio=1/1,framerate=%d/1",
+            output_format, 1920, 1080, color_fps_);
         GstCaps *sink_caps = gst_caps_from_string(sink_caps_str);
         // Configure appsink: async=false allows pipeline to start without waiting for preroll
         g_object_set(G_OBJECT(gst_appsink_),
@@ -335,35 +359,61 @@ namespace pilsbot_oakd
         RCLCPP_DEBUG(this->get_logger(), "Appsink caps: %s", sink_caps_str);
 
         // Link pipeline elements based on configuration
-        // Hardware path: appsrc -> [jpegparse ->] decoder -> nvmm_caps -> nvvidconv -> videoconvert -> appsink
-        // Software path: appsrc -> [jpegparse ->] decoder -> videoconvert -> appsink
+        // Hardware path: appsrc -> [jpegparse ->] decoder -> queue -> nvmm_caps -> nvvidconv -> appsink (I420 output)
+        // Software path: appsrc -> [jpegparse ->] decoder -> queue -> videoconvert -> appsink (BGR output)
         bool link_ok = false;
         if (jpegparse)
         {
             if (nvmm_capsfilter && nvvidconv)
             {
-                gst_bin_add_many(GST_BIN(gst_pipeline_), gst_appsrc_, jpegparse, decoder, nvmm_capsfilter, nvvidconv, videoconvert, gst_appsink_, nullptr);
-                link_ok = gst_element_link(gst_appsrc_, jpegparse) &&
-                          gst_element_link(jpegparse, decoder) &&
-                          gst_element_link(decoder, nvmm_capsfilter) &&
-                          gst_element_link(nvmm_capsfilter, nvvidconv) &&
-                          gst_element_link(nvvidconv, videoconvert) &&
-                          gst_element_link(videoconvert, gst_appsink_);
+                // Hardware path - no videoconvert needed, output I420
+                if (queue)
+                {
+                    gst_bin_add_many(GST_BIN(gst_pipeline_), gst_appsrc_, jpegparse, decoder, queue, nvmm_capsfilter, nvvidconv, gst_appsink_, nullptr);
+                    link_ok = gst_element_link(gst_appsrc_, jpegparse) &&
+                              gst_element_link(jpegparse, decoder) &&
+                              gst_element_link(decoder, queue) &&
+                              gst_element_link(queue, nvmm_capsfilter) &&
+                              gst_element_link(nvmm_capsfilter, nvvidconv) &&
+                              gst_element_link(nvvidconv, gst_appsink_);
+                }
+                else
+                {
+                    gst_bin_add_many(GST_BIN(gst_pipeline_), gst_appsrc_, jpegparse, decoder, nvmm_capsfilter, nvvidconv, gst_appsink_, nullptr);
+                    link_ok = gst_element_link(gst_appsrc_, jpegparse) &&
+                              gst_element_link(jpegparse, decoder) &&
+                              gst_element_link(decoder, nvmm_capsfilter) &&
+                              gst_element_link(nvmm_capsfilter, nvvidconv) &&
+                              gst_element_link(nvvidconv, gst_appsink_);
+                }
                 if (link_ok)
                 {
-                    RCLCPP_DEBUG(this->get_logger(), "Linked appsrc -> jpegparse -> decoder -> nvmm_caps -> nvvidconv -> videoconvert -> appsink");
+                    RCLCPP_DEBUG(this->get_logger(), "Linked HW path: appsrc -> jpegparse -> decoder -> [queue ->] nvmm_caps -> nvvidconv -> appsink");
                 }
             }
             else
             {
-                gst_bin_add_many(GST_BIN(gst_pipeline_), gst_appsrc_, jpegparse, decoder, videoconvert, gst_appsink_, nullptr);
-                link_ok = gst_element_link(gst_appsrc_, jpegparse) &&
-                          gst_element_link(jpegparse, decoder) &&
-                          gst_element_link(decoder, videoconvert) &&
-                          gst_element_link(videoconvert, gst_appsink_);
+                // Software path - use videoconvert for BGR output
+                if (queue)
+                {
+                    gst_bin_add_many(GST_BIN(gst_pipeline_), gst_appsrc_, jpegparse, decoder, queue, videoconvert, gst_appsink_, nullptr);
+                    link_ok = gst_element_link(gst_appsrc_, jpegparse) &&
+                              gst_element_link(jpegparse, decoder) &&
+                              gst_element_link(decoder, queue) &&
+                              gst_element_link(queue, videoconvert) &&
+                              gst_element_link(videoconvert, gst_appsink_);
+                }
+                else
+                {
+                    gst_bin_add_many(GST_BIN(gst_pipeline_), gst_appsrc_, jpegparse, decoder, videoconvert, gst_appsink_, nullptr);
+                    link_ok = gst_element_link(gst_appsrc_, jpegparse) &&
+                              gst_element_link(jpegparse, decoder) &&
+                              gst_element_link(decoder, videoconvert) &&
+                              gst_element_link(videoconvert, gst_appsink_);
+                }
                 if (link_ok)
                 {
-                    RCLCPP_DEBUG(this->get_logger(), "Linked appsrc -> jpegparse -> decoder -> videoconvert -> appsink");
+                    RCLCPP_DEBUG(this->get_logger(), "Linked SW path: appsrc -> jpegparse -> decoder -> [queue ->] videoconvert -> appsink");
                 }
             }
         }
@@ -371,26 +421,50 @@ namespace pilsbot_oakd
         {
             if (nvmm_capsfilter && nvvidconv)
             {
-                gst_bin_add_many(GST_BIN(gst_pipeline_), gst_appsrc_, decoder, nvmm_capsfilter, nvvidconv, videoconvert, gst_appsink_, nullptr);
-                link_ok = gst_element_link(gst_appsrc_, decoder) &&
-                          gst_element_link(decoder, nvmm_capsfilter) &&
-                          gst_element_link(nvmm_capsfilter, nvvidconv) &&
-                          gst_element_link(nvvidconv, videoconvert) &&
-                          gst_element_link(videoconvert, gst_appsink_);
+                // Hardware path without jpegparse
+                if (queue)
+                {
+                    gst_bin_add_many(GST_BIN(gst_pipeline_), gst_appsrc_, decoder, queue, nvmm_capsfilter, nvvidconv, gst_appsink_, nullptr);
+                    link_ok = gst_element_link(gst_appsrc_, decoder) &&
+                              gst_element_link(decoder, queue) &&
+                              gst_element_link(queue, nvmm_capsfilter) &&
+                              gst_element_link(nvmm_capsfilter, nvvidconv) &&
+                              gst_element_link(nvvidconv, gst_appsink_);
+                }
+                else
+                {
+                    gst_bin_add_many(GST_BIN(gst_pipeline_), gst_appsrc_, decoder, nvmm_capsfilter, nvvidconv, gst_appsink_, nullptr);
+                    link_ok = gst_element_link(gst_appsrc_, decoder) &&
+                              gst_element_link(decoder, nvmm_capsfilter) &&
+                              gst_element_link(nvmm_capsfilter, nvvidconv) &&
+                              gst_element_link(nvvidconv, gst_appsink_);
+                }
                 if (link_ok)
                 {
-                    RCLCPP_DEBUG(this->get_logger(), "Linked appsrc -> decoder -> nvmm_caps -> nvvidconv -> videoconvert -> appsink");
+                    RCLCPP_DEBUG(this->get_logger(), "Linked HW path: appsrc -> decoder -> [queue ->] nvmm_caps -> nvvidconv -> appsink");
                 }
             }
             else
             {
-                gst_bin_add_many(GST_BIN(gst_pipeline_), gst_appsrc_, decoder, videoconvert, gst_appsink_, nullptr);
-                link_ok = gst_element_link(gst_appsrc_, decoder) &&
-                          gst_element_link(decoder, videoconvert) &&
-                          gst_element_link(videoconvert, gst_appsink_);
+                // Software path without jpegparse
+                if (queue)
+                {
+                    gst_bin_add_many(GST_BIN(gst_pipeline_), gst_appsrc_, decoder, queue, videoconvert, gst_appsink_, nullptr);
+                    link_ok = gst_element_link(gst_appsrc_, decoder) &&
+                              gst_element_link(decoder, queue) &&
+                              gst_element_link(queue, videoconvert) &&
+                              gst_element_link(videoconvert, gst_appsink_);
+                }
+                else
+                {
+                    gst_bin_add_many(GST_BIN(gst_pipeline_), gst_appsrc_, decoder, videoconvert, gst_appsink_, nullptr);
+                    link_ok = gst_element_link(gst_appsrc_, decoder) &&
+                              gst_element_link(decoder, videoconvert) &&
+                              gst_element_link(videoconvert, gst_appsink_);
+                }
                 if (link_ok)
                 {
-                    RCLCPP_DEBUG(this->get_logger(), "Linked appsrc -> decoder -> videoconvert -> appsink");
+                    RCLCPP_DEBUG(this->get_logger(), "Linked SW path: appsrc -> decoder -> [queue ->] videoconvert -> appsink");
                 }
             }
         }
@@ -474,15 +548,13 @@ namespace pilsbot_oakd
                         RCLCPP_DEBUG(this->get_logger(), "gst_app_src_push_buffer returned %d", (int)fret);
                         if (fret == GST_FLOW_OK)
                         {
-                            GstSample *sample = gst_app_sink_try_pull_sample(GST_APP_SINK(gst_appsink_), GST_MSECOND * 1000);
+                            // Use longer timeout during warmup (first ~10 frames), shorter after
+                            GstClockTime timeout_ms = (gst_frame_count_ < 10) ? 500 : 100;
+                            GstSample *sample = gst_app_sink_try_pull_sample(GST_APP_SINK(gst_appsink_), GST_MSECOND * timeout_ms);
                             if (!sample)
                             {
-                                RCLCPP_DEBUG(this->get_logger(), "gst_app_sink_try_pull_sample returned NULL; trying blocking pull");
-                                sample = gst_app_sink_pull_sample(GST_APP_SINK(gst_appsink_));
-                            }
-                            if (!sample)
-                            {
-                                RCLCPP_WARN(this->get_logger(), "GStreamer did not return a sample after push (NULL)");
+                                // No sample yet - pipeline may still be warming up, continue
+                                RCLCPP_DEBUG(this->get_logger(), "gst_app_sink_try_pull_sample returned NULL (pipeline warming up)");
                             }
                             else
                             {
@@ -518,10 +590,35 @@ namespace pilsbot_oakd
 
                                         if (width > 0 && height > 0 && outmap.data)
                                         {
-                                            cv::Mat tmp(height, width, CV_8UC3, (void *)outmap.data);
-                                            tmp.copyTo(mat);
-                                            decoded = true;
-                                            RCLCPP_DEBUG(this->get_logger(), "Decoded image via GStreamer: %dx%d format=%s", height, width, fmt ? fmt : "?");
+                                            // Handle different output formats
+                                            if (fmt && strcmp(fmt, "I420") == 0)
+                                            {
+                                                // I420 (YUV420P) format from nvvidconv - convert to BGR with OpenCV
+                                                cv::Mat yuv(height + height/2, width, CV_8UC1, (void *)outmap.data);
+                                                cv::cvtColor(yuv, mat, cv::COLOR_YUV2BGR_I420);
+                                                decoded = true;
+                                                gst_frame_count_++;
+                                                RCLCPP_DEBUG(this->get_logger(), "Decoded I420 via GStreamer + cvtColor: %dx%d (frame %d)", width, height, gst_frame_count_);
+                                            }
+                                            else if (fmt && strcmp(fmt, "BGR") == 0)
+                                            {
+                                                // BGR format - use directly (avoid copy if possible)
+                                                cv::Mat tmp(height, width, CV_8UC3, (void *)outmap.data);
+                                                tmp.copyTo(mat);
+                                                decoded = true;
+                                                gst_frame_count_++;
+                                                RCLCPP_DEBUG(this->get_logger(), "Decoded BGR via GStreamer: %dx%d (frame %d)", width, height, gst_frame_count_);
+                                            }
+                                            else
+                                            {
+                                                // Unknown format - try as BGR anyway
+                                                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, 
+                                                    "Unknown GStreamer output format '%s', trying as BGR", fmt ? fmt : "null");
+                                                cv::Mat tmp(height, width, CV_8UC3, (void *)outmap.data);
+                                                tmp.copyTo(mat);
+                                                decoded = true;
+                                                gst_frame_count_++;
+                                            }
                                         }
                                         else
                                         {
@@ -541,15 +638,9 @@ namespace pilsbot_oakd
                 }
                 if (!decoded)
                 {
-                    if (use_gst_)
-                    {
-                        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "GStreamer failed to decode a frame; falling back to cv::imdecode");
-                        use_gst_ = false;
-                    }
-                    else
-                    {
-                        RCLCPP_DEBUG(this->get_logger(), "GStreamer path disabled; using cv::imdecode");
-                    }
+                    // Don't disable GStreamer on first few frames - hardware decoder needs time to warm up
+                    // Just log and continue; the pipeline is still active and will produce frames soon
+                    RCLCPP_DEBUG(this->get_logger(), "GStreamer did not produce a frame this iteration (pipeline may be warming up)");
                 }
 #endif
                 if (mat.empty())

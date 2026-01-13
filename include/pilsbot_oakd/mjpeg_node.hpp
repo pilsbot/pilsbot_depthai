@@ -45,6 +45,7 @@ namespace pilsbot_oakd
 
         // Optional GStreamer decoding (use hardware-accelerated decoder when available)
         bool use_gst_{false};
+        int gst_frame_count_{0};  // Track decoded frames for warmup timeout handling
     #ifdef HAVE_GSTREAMER
         GstElement *gst_pipeline_{nullptr};
         GstElement *gst_appsrc_{nullptr};
