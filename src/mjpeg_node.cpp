@@ -6,6 +6,7 @@
 #include <cstring>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/core.hpp>
 #include <depthai/depthai.hpp>
 #include <atomic>
 #include <thread>
@@ -29,7 +30,7 @@ namespace pilsbot_oakd
         jpeg_quality_ = this->declare_parameter<int>("jpeg_quality", 80);
 
         output_topic_ = this->declare_parameter<std::string>("output_topic", "/camera/color/image_raw");
-        output_encoding_ = this->declare_parameter<std::string>("output_encoding", "bgr8");
+        output_encoding_ = this->declare_parameter<std::string>("output_encoding", "rgb8");
         // Optionally try to use GStreamer-based decoding (hardware-accelerated on Jetson if plugin available)
         use_gst_ = this->declare_parameter<bool>("use_gstreamer", true);
         nv_dec_ = this->declare_parameter<std::string>("nvdecoder", "");
@@ -248,8 +249,12 @@ namespace pilsbot_oakd
         GstElement *queue = gst_element_factory_make("queue", "queue");
         if (queue)
         {
-            // Small queue to reduce latency while still allowing parallelism
-            g_object_set(G_OBJECT(queue), "max-size-buffers", 2, "max-size-time", (guint64)0, "max-size-bytes", 0, nullptr);
+            // Small queue for low latency
+            g_object_set(G_OBJECT(queue), 
+                "max-size-buffers", 2,
+                "max-size-time", (guint64)0,
+                "max-size-bytes", 0,
+                nullptr);
         }
 
         // Capsfilter for NVMM memory between decoder and nvvidconv (only needed for HW path)
@@ -339,21 +344,21 @@ namespace pilsbot_oakd
         gst_caps_unref(src_caps);
         RCLCPP_DEBUG(this->get_logger(), "Appsrc caps: %s (live source)", src_caps_str);
 
-        // For hardware path (nvvidconv), output I420 - we'll convert to BGR with OpenCV (faster)
+        // For hardware path (nvvidconv), output RGBA - hardware does the color conversion
         // For software path, output BGR directly via videoconvert
         char sink_caps_str[256];
-        const char *output_format = using_nvvidconv ? "I420" : "BGR";
+        const char *output_format = using_nvvidconv ? "RGBA" : "BGR";
         snprintf(sink_caps_str, sizeof(sink_caps_str),
             "video/x-raw,format=%s,width=%d,height=%d,pixel-aspect-ratio=1/1,framerate=%d/1",
             output_format, 1920, 1080, color_fps_);
         GstCaps *sink_caps = gst_caps_from_string(sink_caps_str);
-        // Configure appsink: async=false allows pipeline to start without waiting for preroll
+        // Configure appsink for low latency
         g_object_set(G_OBJECT(gst_appsink_),
             "caps", sink_caps,
             "emit-signals", FALSE,
             "max-buffers", 1,
             "drop", TRUE,
-            "sync", FALSE,  // Don't sync to clock (we handle timing)
+            "sync", FALSE,
             nullptr);
         gst_caps_unref(sink_caps);
         RCLCPP_DEBUG(this->get_logger(), "Appsink caps: %s", sink_caps_str);
@@ -523,12 +528,12 @@ namespace pilsbot_oakd
                 bool decoded = false;
                 if (use_gst_ && gst_pipeline_ && gst_appsrc_ && gst_appsink_)
                 {
-                    // TODO: Only allocate this once.
                     RCLCPP_DEBUG(this->get_logger(), "GStreamer path enabled: attempting to decode %zu bytes", buf.size());
+                    // Allocate buffer for this frame - appsrc takes ownership
                     GstBuffer *gst_buf = gst_buffer_new_allocate(NULL, buf.size(), NULL);
                     if (!gst_buf)
                     {
-                        RCLCPP_WARN(this->get_logger(), "gst_buffer_new_allocate returned NULL for size %zu", buf.size());
+                        RCLCPP_WARN(this->get_logger(), "Failed to allocate GStreamer buffer for size %zu", buf.size());
                     }
                     else
                     {
@@ -536,103 +541,117 @@ namespace pilsbot_oakd
                         if (!gst_buffer_map(gst_buf, &map, GST_MAP_WRITE))
                         {
                             RCLCPP_WARN(this->get_logger(), "gst_buffer_map (write) failed for input buffer");
+                            gst_buffer_unref(gst_buf);
                         }
                         else
                         {
                             memcpy(map.data, buf.data(), buf.size());
                             gst_buffer_unmap(gst_buf, &map);
-                            RCLCPP_DEBUG(this->get_logger(), "Copied %zu bytes into gst buffer", buf.size());
-                        }
 
-                        GstFlowReturn fret = gst_app_src_push_buffer(GST_APP_SRC(gst_appsrc_), gst_buf);
-                        RCLCPP_DEBUG(this->get_logger(), "gst_app_src_push_buffer returned %d", (int)fret);
-                        if (fret == GST_FLOW_OK)
-                        {
-                            // Use longer timeout during warmup (first ~10 frames), shorter after
-                            GstClockTime timeout_ms = (gst_frame_count_ < 10) ? 500 : 100;
-                            GstSample *sample = gst_app_sink_try_pull_sample(GST_APP_SINK(gst_appsink_), GST_MSECOND * timeout_ms);
-                            if (!sample)
+                            // Push buffer to GStreamer - gst_app_src_push_buffer takes ownership
+                            GstFlowReturn fret = gst_app_src_push_buffer(GST_APP_SRC(gst_appsrc_), gst_buf);
+                            RCLCPP_DEBUG(this->get_logger(), "gst_app_src_push_buffer returned %d", (int)fret);
+                            if (fret == GST_FLOW_OK)
                             {
-                                // No sample yet - pipeline may still be warming up, continue
-                                RCLCPP_DEBUG(this->get_logger(), "gst_app_sink_try_pull_sample returned NULL (pipeline warming up)");
-                            }
-                            else
-                            {
-                                GstBuffer *outbuf = gst_sample_get_buffer(sample);
-                                if (!outbuf)
+                                // Use longer timeout during warmup (first ~10 frames), shorter after
+                                GstClockTime timeout_ms = (gst_frame_count_ < 10) ? 500 : 100;
+                                GstSample *sample = gst_app_sink_try_pull_sample(GST_APP_SINK(gst_appsink_), GST_MSECOND * timeout_ms);
+                                if (!sample)
                                 {
-                                    RCLCPP_WARN(this->get_logger(), "gst_sample_get_buffer returned NULL");
+                                    // No sample yet - pipeline may still be warming up, continue
+                                    RCLCPP_DEBUG(this->get_logger(), "gst_app_sink_try_pull_sample returned NULL (pipeline warming up)");
                                 }
                                 else
                                 {
-                                    GstMapInfo outmap;
-                                    if (!gst_buffer_map(outbuf, &outmap, GST_MAP_READ))
+                                    GstBuffer *outbuf = gst_sample_get_buffer(sample);
+                                    if (!outbuf)
                                     {
-                                        RCLCPP_WARN(this->get_logger(), "gst_buffer_map (read) failed on output buffer");
+                                        RCLCPP_WARN(this->get_logger(), "gst_sample_get_buffer returned NULL");
                                     }
                                     else
                                     {
-                                        GstCaps *caps = gst_sample_get_caps(sample);
-                                        int width = 0, height = 0;
-                                        const gchar *fmt = nullptr;
-                                        if (caps)
+                                        GstMapInfo outmap;
+                                        if (!gst_buffer_map(outbuf, &outmap, GST_MAP_READ))
                                         {
-                                            GstStructure *s = gst_caps_get_structure(caps, 0);
-                                            fmt = gst_structure_get_string(s, "format");
-                                            gst_structure_get_int(s, "width", &width);
-                                            gst_structure_get_int(s, "height", &height);
-                                            RCLCPP_DEBUG(this->get_logger(), "GStreamer output caps: format=%s width=%d height=%d", fmt ? fmt : "unknown", width, height);
+                                            RCLCPP_WARN(this->get_logger(), "gst_buffer_map (read) failed on output buffer");
                                         }
                                         else
                                         {
-                                            RCLCPP_DEBUG(this->get_logger(), "GStreamer sample has no caps");
-                                        }
-
-                                        if (width > 0 && height > 0 && outmap.data)
-                                        {
-                                            // Handle different output formats
-                                            if (fmt && strcmp(fmt, "I420") == 0)
+                                            GstCaps *caps = gst_sample_get_caps(sample);
+                                            int width = 0, height = 0;
+                                            const gchar *fmt = nullptr;
+                                            if (caps)
                                             {
-                                                // I420 (YUV420P) format from nvvidconv - convert to BGR with OpenCV
-                                                cv::Mat yuv(height + height/2, width, CV_8UC1, (void *)outmap.data);
-                                                cv::cvtColor(yuv, mat, cv::COLOR_YUV2BGR_I420);
-                                                decoded = true;
-                                                gst_frame_count_++;
-                                                RCLCPP_DEBUG(this->get_logger(), "Decoded I420 via GStreamer + cvtColor: %dx%d (frame %d)", width, height, gst_frame_count_);
-                                            }
-                                            else if (fmt && strcmp(fmt, "BGR") == 0)
-                                            {
-                                                // BGR format - use directly (avoid copy if possible)
-                                                cv::Mat tmp(height, width, CV_8UC3, (void *)outmap.data);
-                                                tmp.copyTo(mat);
-                                                decoded = true;
-                                                gst_frame_count_++;
-                                                RCLCPP_DEBUG(this->get_logger(), "Decoded BGR via GStreamer: %dx%d (frame %d)", width, height, gst_frame_count_);
+                                                GstStructure *s = gst_caps_get_structure(caps, 0);
+                                                fmt = gst_structure_get_string(s, "format");
+                                                gst_structure_get_int(s, "width", &width);
+                                                gst_structure_get_int(s, "height", &height);
+                                                RCLCPP_DEBUG(this->get_logger(), "GStreamer output caps: format=%s width=%d height=%d", fmt ? fmt : "unknown", width, height);
                                             }
                                             else
                                             {
-                                                // Unknown format - try as BGR anyway
-                                                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, 
-                                                    "Unknown GStreamer output format '%s', trying as BGR", fmt ? fmt : "null");
-                                                cv::Mat tmp(height, width, CV_8UC3, (void *)outmap.data);
-                                                tmp.copyTo(mat);
-                                                decoded = true;
-                                                gst_frame_count_++;
+                                                RCLCPP_DEBUG(this->get_logger(), "GStreamer sample has no caps");
                                             }
+
+                                            if (width > 0 && height > 0 && outmap.data)
+                                            {
+                                                // Handle different output formats
+                                                if (fmt && strcmp(fmt, "RGBA") == 0)
+                                                {
+                                                    // RGBA format from nvvidconv - convert to RGB by dropping alpha
+                                                    cv::Mat rgba(height, width, CV_8UC4, (void *)outmap.data);
+                                                    cv::cvtColor(rgba, mat, cv::COLOR_RGBA2RGB);
+                                                    decoded = true;
+                                                    gst_frame_count_++;
+                                                    RCLCPP_DEBUG(this->get_logger(), "Decoded RGBA via GStreamer HW: %dx%d (frame %d)", width, height, gst_frame_count_);
+                                                }
+                                                else if (fmt && strcmp(fmt, "I420") == 0)
+                                                {
+                                                    // I420 (YUV420P) format - fallback
+                                                    cv::Mat yuv(height + height/2, width, CV_8UC1, (void *)outmap.data);
+                                                    if (mat.empty() || mat.rows != height || mat.cols != width)
+                                                    {
+                                                        mat.create(height, width, CV_8UC3);
+                                                    }
+                                                    cv::cvtColor(yuv, mat, cv::COLOR_YUV2RGB_I420);
+                                                    decoded = true;
+                                                    gst_frame_count_++;
+                                                    RCLCPP_DEBUG(this->get_logger(), "Decoded I420 via GStreamer + cvtColor: %dx%d (frame %d)", width, height, gst_frame_count_);
+                                                }
+                                                else if (fmt && strcmp(fmt, "BGR") == 0)
+                                                {
+                                                    // BGR format from software path - convert to RGB
+                                                    cv::Mat tmp(height, width, CV_8UC3, (void *)outmap.data);
+                                                    cv::cvtColor(tmp, mat, cv::COLOR_BGR2RGB);
+                                                    decoded = true;
+                                                    gst_frame_count_++;
+                                                    RCLCPP_DEBUG(this->get_logger(), "Decoded BGR via GStreamer, converted to RGB: %dx%d (frame %d)", width, height, gst_frame_count_);
+                                                }
+                                                else
+                                                {
+                                                    // Unknown format - try as BGR anyway
+                                                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, 
+                                                        "Unknown GStreamer output format '%s', trying as BGR", fmt ? fmt : "null");
+                                                    cv::Mat tmp(height, width, CV_8UC3, (void *)outmap.data);
+                                                    tmp.copyTo(mat);
+                                                    decoded = true;
+                                                    gst_frame_count_++;
+                                                }
+                                            }
+                                            else
+                                            {
+                                                RCLCPP_WARN(this->get_logger(), "GStreamer returned sample but invalid dimensions or data (w=%d h=%d data=%p)", width, height, outmap.data);
+                                            }
+                                            gst_buffer_unmap(outbuf, &outmap);
                                         }
-                                        else
-                                        {
-                                            RCLCPP_WARN(this->get_logger(), "GStreamer returned sample but invalid dimensions or data (w=%d h=%d data=%p)", width, height, outmap.data);
-                                        }
-                                        gst_buffer_unmap(outbuf, &outmap);
                                     }
+                                    gst_sample_unref(sample);
                                 }
-                                gst_sample_unref(sample);
                             }
-                        }
-                        else
-                        {
-                            RCLCPP_WARN(this->get_logger(), "gst_app_src_push_buffer returned flow %d (not GST_FLOW_OK)", (int)fret);
+                            else
+                            {
+                                RCLCPP_WARN(this->get_logger(), "gst_app_src_push_buffer returned flow %d (not GST_FLOW_OK)", (int)fret);
+                            }
                         }
                     }
                 }
