@@ -7,6 +7,7 @@
 
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/image.hpp"
+#include "sensor_msgs/msg/compressed_image.hpp"
 #include "cv_bridge/cv_bridge.h"
 
 #include <atomic>
@@ -33,7 +34,6 @@ namespace pilsbot_oakd
         void start_device();
         void stop_device();
         void worker_loop();
-        void image_callback(const sensor_msgs::msg::CompressedImage::SharedPtr msg);
 
         // DepthAI
         std::shared_ptr<dai::Device> device_;
@@ -54,6 +54,9 @@ namespace pilsbot_oakd
 
         // ROS pub
         rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_;
+        // Compressed pass-through: raw JPEG bytes from the camera, no re-encode.
+        // Use this topic from remote machines to avoid DDS UDP fragmentation of ~900 KB raw frames.
+        rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr pub_compressed_;
 
         // parameters
         std::string output_topic_;
