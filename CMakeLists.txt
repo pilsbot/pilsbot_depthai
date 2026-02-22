@@ -18,6 +18,15 @@ endif()
 # find dependencies
 find_package(ament_cmake REQUIRED)
 
+# Try to find GStreamer (optional). If found we will compile with GStreamer support
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(GST REQUIRED gstreamer-1.0 gstreamer-app-1.0 QUIET)
+if(GST_FOUND)
+  message(STATUS "Found GStreamer: ${GST_VERSION}")
+  add_compile_definitions(HAVE_GSTREAMER=1)
+endif()
+
+find_package(backward_ros REQUIRED)
 find_package(camera_info_manager REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(depthai CONFIG REQUIRED)
@@ -46,13 +55,28 @@ include_directories(
   ${ament_INCLUDE_DIRS}
 )
 
+SET(LINKER_LIBS
+  depthai::core
+  opencv_imgproc
+  opencv_highgui
+  avcodec 
+  avformat 
+  avutil 
+  avdevice 
+  avfilter 
+  swscale
+)
+if(GST_FOUND)
+  list(APPEND LINKER_LIBS ${GST_LIBRARIES})
+endif()
+
 macro(dai_add_node_ros2 node_name node_src)
   add_executable("${node_name}" "${node_src}")
 
-  target_link_libraries("${node_name}"
-                        depthai::core
-                        opencv_imgproc
-                        opencv_highgui)
+  target_link_libraries("${node_name}" ${LINKER_LIBS})
+  if(GST_FOUND)
+    target_include_directories("${node_name}" PRIVATE ${GST_INCLUDE_DIRS})
+  endif()
 
   ament_target_dependencies("${node_name}"
                             ${dependencies})
@@ -60,6 +84,8 @@ macro(dai_add_node_ros2 node_name node_src)
 endmacro()
 
 dai_add_node_ros2(rgb_stereo_node src/rgb_stereo_node.cpp)
+# dai_add_node_ros2(h265_node src/h265_node.cpp)
+dai_add_node_ros2(mjpeg_node src/mjpeg_node.cpp)
 
 
 if(BUILD_TESTING)
@@ -74,7 +100,9 @@ if(BUILD_TESTING)
 endif()
 
 install(TARGETS
-        rgb_stereo_node
+  rgb_stereo_node
+  # h265_node
+  mjpeg_node
         DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY launch/ DESTINATION share/${PROJECT_NAME}/launch
